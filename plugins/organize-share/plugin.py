@@ -18,20 +18,27 @@ import re
 import json
 import time
 import traceback
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
 
 
 PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
         "首次运行只记录基线（不发群），避免历史刷屏。支持快速/全量扫描、回填补发、试运行、获取群 chat_id。"
-        "可通过开关开启「同步发送到社区/频道」，把分享同时发到你自己的 Telegram 社区或频道。"
+        "可通过开关把每个新分享发布到 pan1.me 资源社区（Xiuno 论坛主题帖，带标题去重）。"
     ),
     "author": "wistar",
     "entry": "plugin.py",
@@ -136,20 +143,40 @@ PLUGIN_MANIFEST = {
         },
         {
             "name": "community_enabled",
-            "label": "同步发送到社区/频道",
+            "label": "发布到 pan1.me 资源社区",
             "type": "switch",
             "required": False,
             "default": False,
-            "help": "关闭则只发 TG 群（或不发）。开启后，分享链接会同时发送到「社区/频道 chat_id」对应的 Telegram 社区或频道；需把机器人拉进该社区/频道并赋予发消息权限。",
+            "help": "关闭则只发 TG 群（或不发）。开启后，每个新分享会在 pan1.me 论坛发一个主题帖，凭据自动读 user.env 的 ENV_123PANFX_COOKIE / ENV_123PANFX_BASE_URL / ENV_FORUM_UID。",
         },
         {
-            "name": "community_chat_id",
-            "label": "社区/频道 chat_id",
+            "name": "forum_fid",
+            "label": "社区版块",
             "type": "text",
             "required": False,
-            "default": "",
-            "placeholder": "-1001234567890",
-            "help": "开启「同步发送到社区」后生效。Telegram 社区/频道的 chat_id（通常为 -100 开头的负数）。",
+            "default": "auto",
+            "placeholder": "auto 或版块ID，如 48",
+            "help": "auto=按分类自动选（电影→2、剧集→48、动漫→37、综艺→52、纪录片/儿童/演唱会→45资源互助）；或填固定版块ID：2电影 48电视剧 37动漫 52综艺 59短剧 56-4K原盘 45资源互助。",
+        },
+        {
+            "name": "forum_link_field",
+            "label": "分享链接放置方式",
+            "type": "select",
+            "default": "http_url",
+            "options": [
+                {"label": "回复可见（http_url，推荐）", "value": "http_url"},
+                {"label": "登录可见（vod_url）", "value": "vod_url"},
+                {"label": "直接写进正文（所有人可见）", "value": "message"},
+            ],
+            "help": "分享链接放在论坛帖子的哪个字段。回复/登录可见会隐藏链接，需用户回复或登录后才显示。",
+        },
+        {
+            "name": "forum_dedup",
+            "label": "发帖前去重",
+            "type": "switch",
+            "required": False,
+            "default": True,
+            "help": "发帖前拉取「我的主题」，若已存在同题帖（含 TgtoDrive 自带发帖）则跳过，避免重复刷帖。",
         },
         {
             "name": "template",
@@ -179,7 +206,9 @@ PLUGIN_MANIFEST = {
             {"type": "field", "name": "media_exclude"},
             {"type": "field", "name": "post_enabled"},
             {"type": "field", "name": "community_enabled"},
-            {"type": "field", "name": "community_chat_id"},
+            {"type": "field", "name": "forum_fid"},
+            {"type": "field", "name": "forum_link_field"},
+            {"type": "field", "name": "forum_dedup"},
             {"type": "field", "name": "template"},
         ],
     },
@@ -194,6 +223,17 @@ DEFAULT_TEMPLATE = "🎬 《{title}》{year_block}\n📂 分类：{category}\n�
 TMDB_RE = re.compile(r"\{tmdb[a-z-]*?-?\d+\}", re.I)
 YEAR_RE = re.compile(r"\((\d{4})\)")
 CAT_RE = re.compile(r"剧集|电影|综艺|动漫|纪录片|短剧|合集|资料|演唱会|儿童节目")
+
+# pan1.me 资源社区（Xiuno 论坛）发帖：分类 -> 版块 fid
+FORUM_CATEGORY_FID = {
+    "电影": "2", "剧集": "48", "电视剧": "48", "动漫": "37",
+    "综艺": "52", "短剧": "59", "纪录片": "45",
+    "儿童节目": "45", "演唱会": "45",
+}
+FORUM_FID_NAMES = {
+    "2": "电影", "48": "电视剧", "37": "动漫", "52": "综艺", "59": "短剧",
+    "56": "4K原盘", "45": "资源互助", "40": "音频", "43": "反馈", "51": "电子书",
+}
 
 
 # ---------------------- 工具函数 ----------------------
@@ -442,21 +482,260 @@ def _build_message(title_info, url, pwd, template):
         )
 
 
+# ---------------------- pan1.me 资源社区发帖 ----------------------
+FORUM_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _forum_cfg(env):
+    base = (env.get("ENV_123PANFX_BASE_URL") or "https://pan1.me").rstrip("/")
+    return base, env.get("ENV_123PANFX_COOKIE", ""), env.get("ENV_FORUM_UID", "")
+
+
+def _forum_new_session(cookie):
+    s = requests.Session()
+    s.headers.update({"User-Agent": FORUM_UA})
+    for part in (cookie or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            s.cookies.set(k.strip(), v.strip(), domain="pan1.me")
+    return s
+
+
+def _balanced(text, op, cl, start):
+    depth = 0
+    instr = False
+    esc = False
+    for j in range(start, len(text)):
+        c = text[j]
+        if esc:
+            esc = False
+            continue
+        if c == "\\":
+            esc = True
+            continue
+        if c == '"':
+            instr = not instr
+            continue
+        if instr:
+            continue
+        if c == op:
+            depth += 1
+        elif c == cl:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _forum_parse_tags(html):
+    """从发帖表单解析 tagcatelist/tagcatemap -> {fid: [ {isforce, tags:[(tagid,name)]} ]}。
+    tagcatelist 与 tagcatemap 是同一数据的两种形态，按标签集合去重避免重复分类。"""
+    by_fid = {}
+    seen_sig = {}
+    for key, op, cl in (('"tagcatemap"', "{", "}"), ('"tagcatelist"', "[", "]")):
+        idx = 0
+        while True:
+            i = html.find(key, idx)
+            if i < 0:
+                break
+            start = html.find(op, i)
+            if start < 0:
+                idx = i + 1
+                continue
+            end = _balanced(html, op, cl, start)
+            if end < 0:
+                idx = i + 1
+                continue
+            chunk = html[start:end]
+            idx = end
+            if len(chunk) < 20:
+                continue
+            try:
+                obj = json.loads(chunk)
+            except Exception:
+                continue
+            entries = obj.values() if isinstance(obj, dict) else obj
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                fid = str(e.get("fid") or "")
+                tags = [(str(t.get("tagid")), t.get("name") or "")
+                        for t in (e.get("taglist") or [])
+                        if isinstance(t, dict) and t.get("tagid")]
+                if fid and tags:
+                    sig = frozenset(t[0] for t in tags)
+                    seen = seen_sig.setdefault(fid, set())
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    by_fid.setdefault(fid, []).append(
+                        {"isforce": str(e.get("isforce")) == "1", "tags": tags})
+    return by_fid
+
+
+def _forum_pick_tags(tags_by_fid, fid, name_hint):
+    """每个强制标签分类选一个 tagid：优先名称命中 name_hint，其次「其他/其它」，再第一个。"""
+    picked = []
+    hint = (name_hint or "").lower()
+    for cat in tags_by_fid.get(str(fid), []):
+        if not cat.get("isforce"):
+            continue
+        tags = cat["tags"]
+        choice = None
+        for tid, name in tags:
+            if name and name.lower() in hint:
+                choice = tid
+                break
+        if not choice:
+            for tid, name in tags:
+                if name in ("其他", "其它", "Other", "other"):
+                    choice = tid
+                    break
+        if not choice and tags:
+            choice = tags[0][0]
+        if choice:
+            picked.append(choice)
+    uniq = []
+    for x in picked:
+        if x not in uniq:
+            uniq.append(x)
+    return uniq
+
+
+def _forum_my_titles(session, base, uid):
+    """拉取「我的主题」-> [(tid, title)]，用于去重与发帖后取 tid（排除 user-thread 导航链接）。"""
+    out = []
+    if not uid:
+        return out
+    try:
+        html = session.get(base + "/?user-thread-%s.htm" % uid, timeout=30).text
+    except Exception as e:
+        print("社区：拉取我的主题失败 %s" % e)
+        return out
+    for href, tid, text in re.findall(
+            r'<a[^>]+href="([?/]thread-(\d+)\.htm[^"]*)"[^>]*>(.*?)</a>',
+            html, re.S | re.I):
+        if "#comments" in href:
+            continue
+        t = re.sub(r"<[^>]+>", "", text).strip()
+        if t:
+            out.append((tid, t))
+    return out
+
+
+def _forum_already_posted(titles, core_title):
+    if not core_title or len(core_title) < 2:
+        return False
+    low = core_title.lower()
+    return any(low in (t[1] if isinstance(t, (list, tuple)) else str(t)).lower()
+               for t in titles)
+
+
+def _category_to_fid(category, fixed):
+    fixed = (fixed or "").strip()
+    if fixed and fixed.lower() != "auto":
+        return fixed
+    for key, fid in FORUM_CATEGORY_FID.items():
+        if key in (category or ""):
+            return fid
+    return "45"
+
+
+def _forum_subject(title_info):
+    title, year, _ = _parse_title(title_info["name"])
+    s = "%s (%s)" % (title, year) if year else title
+    return s.strip()[:100]
+
+
+def _forum_message(title_info, pwd, cat):
+    title, year, _ = _parse_title(title_info["name"])
+    head = "《%s》%s" % (title, " (%s)" % year if year else "")
+    lines = [head]
+    if cat:
+        lines.append("分类：%s" % cat)
+    if pwd:
+        lines.append("提取码：%s" % pwd)
+    return "\n".join(lines)
+
+
+def _forum_publish(session, base, fid, subject, message, link_field, link, name_hint):
+    """发主题帖：先 GET 表单刷新会话并解析标签，选好各强制分类的 tagid，再 POST。
+    注意：pan1.me 发帖成功不跳转到新主题（返回 200 表单页），成功与否由 _forum_find 查我的主题确认。"""
+    form = session.get(base + "/?thread-create-0.htm", timeout=30)
+    tags_by_fid = _forum_parse_tags(form.text)
+    tagids = _forum_pick_tags(tags_by_fid, fid, name_hint)
+    data = {
+        "doctype": "1", "quotepid": "0", "fid": str(fid),
+        "subject": subject, "message": message,
+        "vod_url": "", "http_url": "",
+    }
+    if link_field == "message":
+        data["message"] = (message + "\n" + (link or "")).strip()
+    elif link_field in ("http_url", "vod_url") and link:
+        data[link_field] = link
+    if tagids:
+        data["tagid[]"] = tagids
+    r = session.post(base + "/?thread-create.htm", data=data,
+                     headers={"Referer": base + "/?thread-create-0.htm"},
+                     timeout=45, allow_redirects=True)
+    return {
+        "http": r.status_code, "tagids": tagids,
+        "resp_len": len(r.text), "final_url": r.url,
+        "snippet": re.sub(r"\s+", " ", r.text)[:200],
+    }
+
+
+def _forum_find(session, base, uid, subject):
+    """发帖后查我的主题，按标题匹配取 (tid, url)；找不到返回 None（即未发成功）。"""
+    key = (subject or "").strip().lower()
+    if not key:
+        return None
+    for tid, title in _forum_my_titles(session, base, uid):
+        tl = title.strip().lower()
+        if tl == key or key in tl or tl in key:
+            return tid, base + "/?thread-%s.htm" % tid
+    return None
+
+
 def _get_chat_id(token):
     url = "https://api.telegram.org/bot%s/getUpdates" % token
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
             res = json.loads(r.read().decode("utf-8"))
     except Exception as e:
+        code = getattr(e, "code", None)
+        if code == 409 or "409" in str(e):
+            return {
+                "error": "getUpdates 被占用（HTTP 409）",
+                "hint": "该 bot 的更新正被 TgtoDrive 主程序的 getUpdates 长轮询占用"
+                        "（同一 bot 只允许一个 getUpdates 连接），插件无法用 getUpdates 直接读群 ID。"
+                        "请改用外部方式：从目标群转发任意一条消息给 @userinfobot 或 @getidsbot，"
+                        "它回复的数字 ID（形如 -100xxxxxxxxxx）即为群 chat_id，填到「目标 TG 群 chat_id」并保存。",
+                "groups": [],
+            }
         return {"error": "getUpdates 失败: %s" % e}
     groups = []
     for u in res.get("result", []):
-        ch = u.get("message", {}).get("chat", {})
-        if ch.get("type") in ("group", "supergroup"):
-            groups.append({"chat_id": ch["id"], "title": ch.get("title"), "type": ch.get("type")})
+        msg = (u.get("message") or u.get("channel_post") or u.get("edited_message")
+               or u.get("edited_channel_post") or {})
+        ch = msg.get("chat") or {}
+        fwd = msg.get("forward_from_chat") or {}
+        if fwd:
+            cid, ctype, ctitle = fwd.get("id"), fwd.get("type"), fwd.get("title")
+        else:
+            cid, ctype, ctitle = ch.get("id"), ch.get("type"), ch.get("title")
+        if cid and ctype in ("group", "supergroup", "channel"):
+            groups.append({"chat_id": cid, "title": ctitle, "type": ctype})
+    uniq = {}
+    for g in groups:
+        uniq[str(g["chat_id"])] = g
+    groups = list(uniq.values())
     if not groups:
         return {
-            "hint": "未在最近更新中找到群聊。请确认 @OracleTgto123_Bot 已在群内，且群内有新消息，再运行本模式。",
+            "hint": "未在最近更新中读到群聊（更新可能已被主程序消费，或群里还没有「命令 / @真提及 / 转发」类消息）。"
+                    "更可靠的方式：从目标群转发任意消息给 @userinfobot 或 @getidsbot，"
+                    "把返回的数字 ID（形如 -100xxxxxxxxxx）填到「目标 TG 群 chat_id」并保存。",
             "groups": [],
         }
     return {
@@ -506,11 +785,29 @@ def run(params, context):
         full_every = 20
     post_enabled = bool(params.get("post_enabled", True))
     community_enabled = bool(params.get("community_enabled", False))
-    community_chat_id = (params.get("community_chat_id") or "").strip()
+    forum_fid = (params.get("forum_fid") or "auto").strip()
+    forum_link_field = (params.get("forum_link_field") or "http_url").strip()
+    forum_dedup = bool(params.get("forum_dedup", True))
     template = params.get("template") or DEFAULT_TEMPLATE
     include = _lines(params.get("media_include"))
     exclude = _lines(params.get("media_exclude"))
     token = env.get("ENV_TG_BOT_TOKEN")
+
+    forum_base, forum_cookie, forum_uid = _forum_cfg(env)
+    forum_session = None
+    forum_titles = []
+    if community_enabled:
+        if requests is None:
+            print("community_enabled=true 但容器缺少 requests 库，跳过社区发帖")
+            community_enabled = False
+        elif not forum_cookie:
+            print("community_enabled=true 但 user.env 缺少 ENV_123PANFX_COOKIE，本次跳过社区发帖")
+            community_enabled = False
+        else:
+            forum_session = _forum_new_session(forum_cookie)
+            if forum_dedup:
+                forum_titles = _forum_my_titles(forum_session, forum_base, forum_uid)
+                print("社区去重：已拉取我的论坛主题 %d 个" % len(forum_titles))
 
     if mode == "get_chat_id":
         if not token:
@@ -613,21 +910,46 @@ def run(params, context):
         elif not post_enabled:
             print("post_enabled=false，仅建链未发送: %s" % t["name"])
         community_posted = False
-        if community_enabled and community_chat_id:
-            try:
-                _bot_send(token, community_chat_id, msg)
-                community_posted = True
-            except Exception as e:
-                print("发送失败(社区) %s: %s" % (t.get("name"), e))
-        elif community_enabled and not community_chat_id:
-            print("community_enabled=true 但未配置 community_chat_id，跳过社区发送")
+        community_info = "未发社区"
+        if community_enabled:
+            title_core = _parse_title(t["name"])[0]
+            if forum_dedup and _forum_already_posted(forum_titles, title_core):
+                print("社区去重：已存在同题帖，跳过 %s" % t["name"])
+                community_info = "去重跳过"
+                forum_titles.append(("", t["name"]))
+            else:
+                try:
+                    cat = _derive_category(t["path"])
+                    fid = _category_to_fid(cat, forum_fid)
+                    subject = _forum_subject(t)
+                    fmsg = _forum_message(t, diy_pwd, cat)
+                    pub = _forum_publish(forum_session, forum_base, fid, subject,
+                                         fmsg, forum_link_field, url, t["name"])
+                    found = _forum_find(forum_session, forum_base, forum_uid, subject)
+                    if found:
+                        tid, turl = found
+                        community_posted = True
+                        community_info = "已发社区(%s) #%s" % (
+                            FORUM_FID_NAMES.get(str(fid), "fid=%s" % fid), tid)
+                        forum_titles.append((tid, subject))
+                        print("社区发帖成功 %s -> %s (tags=%s)" % (t["name"], turl, pub.get("tagids")))
+                    else:
+                        community_info = "发帖未确认"
+                        print("社区发帖未确认 %s | final=%s | %s" % (
+                            t["name"], pub.get("final_url"), pub.get("snippet")))
+                except Exception as e:
+                    community_info = "发帖异常"
+                    print("社区发帖异常 %s: %s" % (t["name"], e))
         state[fid] = {
             "name": t["name"], "path": t["path"], "share_key": key,
             "share_url": url, "posted": posted,
-            "community_posted": community_posted, "ts": int(time.time()),
+            "community_posted": community_posted, "community_info": community_info,
+            "ts": int(time.time()),
         }
         processed += 1
-        results.append({"name": t["name"], "url": url, "posted": posted, "community_posted": community_posted})
+        results.append({"name": t["name"], "url": url, "posted": posted,
+                        "community_posted": community_posted,
+                        "community_info": community_info})
 
     meta["cycle"] = cycle
     if do_full:
@@ -637,16 +959,20 @@ def run(params, context):
 
     sent = sum(1 for r in results if r["posted"])
     sent_comm = sum(1 for r in results if r.get("community_posted"))
-    print("本次处理 %d 个，发群 %d 个，发社区 %d 个" % (processed, sent, sent_comm))
+    skipped_comm = sum(1 for r in results if r.get("community_info") == "去重跳过")
+    print("本次处理 %d 个，发群 %d 个，社区发帖 %d 个（去重跳过 %d）" % (
+        processed, sent, sent_comm, skipped_comm))
     rows = [[
         r["name"], r["url"] or "",
-        ("已发群" if r["posted"] else "未发群") + ("/已发社区" if r.get("community_posted") else "/未发社区"),
+        ("已发群" if r["posted"] else "未发群") + "/" + (
+            r.get("community_info") or ("已发社区" if r.get("community_posted") else "未发社区")),
     ] for r in results[:50]]
     return {
         "新增标题": len(new),
         "本次处理": processed,
         "发送成功(群)": sent,
-        "发送成功(社区)": sent_comm,
+        "社区发帖成功": sent_comm,
+        "社区去重跳过": skipped_comm,
         "ui": {
             "layout": "stack",
             "components": [
