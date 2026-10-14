@@ -15,6 +15,7 @@ ENV_TG_BOT_TOKEN / ENV_DIY_LINK_PWD / ENV_123_ORGANIZE_TARGET_PID）。
 
 import os
 import re
+import html as _html
 import json
 import time
 import traceback
@@ -33,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -179,12 +180,20 @@ PLUGIN_MANIFEST = {
             "help": "发帖前拉取「我的主题」，若已存在同题帖（含 TgtoDrive 自带发帖）则跳过，避免重复刷帖。",
         },
         {
+            "name": "rich_message",
+            "label": "富文本分享卡片",
+            "type": "switch",
+            "required": False,
+            "default": True,
+            "help": "开启后自动解析文件夹内视频文件（画质/编码/音频/体积/集数）并按 {tmdb} id 抓取 TMDB 资料（评分/简介/播出日期/标签/海报），以「海报+详情」卡片发到群里；失败自动回退纯文本。关闭则使用下方自定义模板。",
+        },
+        {
             "name": "template",
             "label": "消息模板",
             "type": "textarea",
             "required": False,
             "default": "🎬 《{title}》{year_block}\n📂 分类：{category}\n🔗 分享链接：{url}\n🔑 提取码：{pwd}",
-            "help": "变量：{title}标题 {year}年份 {year_block}(年份) {category}分类 {url}链接 {pwd}提取码 {name}原文件夹名。",
+            "help": "仅富文本关闭时生效。变量：{title} {year} {year_block} {category} {url} {pwd} {name}，以及 {quality}画质 {video}视频 {audio}音频 {size}体积 {episodes}集数 {vote}评分 {date}播出日期 {overview}简介 {genres}标签。",
         },
     ],
     "ui": {
@@ -209,6 +218,7 @@ PLUGIN_MANIFEST = {
             {"type": "field", "name": "forum_fid"},
             {"type": "field", "name": "forum_link_field"},
             {"type": "field", "name": "forum_dedup"},
+            {"type": "field", "name": "rich_message"},
             {"type": "field", "name": "template"},
         ],
     },
@@ -466,22 +476,247 @@ def _bot_send(token, chat_id, text):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _build_message(title_info, url, pwd, template):
+def _build_message(title_info, url, pwd, template, extra=None):
     title, year, tmdb = _parse_title(title_info["name"])
     cat = _derive_category(title_info["path"])
     year_block = "(%s)" % year if year else ""
     if not template or "{url}" not in template:
         template = DEFAULT_TEMPLATE
+    kwargs = {
+        "title": title, "year": year, "year_block": year_block,
+        "category": cat, "url": url, "pwd": pwd, "name": title_info["name"],
+    }
+    kwargs.update(extra or {})
     try:
-        return template.format(
-            title=title, year=year, year_block=year_block,
-            category=cat, url=url, pwd=pwd, name=title_info["name"],
-        )
+        return template.format(**kwargs)
     except (KeyError, IndexError):
-        return DEFAULT_TEMPLATE.format(
-            title=title, year=year, year_block=year_block,
-            category=cat, url=url, pwd=pwd, name=title_info["name"],
-        )
+        return DEFAULT_TEMPLATE.format(**kwargs)
+
+
+# ---------------------- 富文本分享卡片（v1.0.3） ----------------------
+VIDEO_EXT_RE = re.compile(
+    r"\.(mkv|mp4|ts|m2ts|mts|avi|wmv|rmvb|mov|iso|mpg|mpeg|vob|flv|webm)$", re.I)
+EP_RE = re.compile(r"S\d{1,2}\.?[Ee](\d{1,4})")
+EP_CN_RE = re.compile(r"第(\d{1,4})集")
+QUALITY_RES = [
+    ("8K", re.compile(r"4320p|8K", re.I)),
+    ("4K", re.compile(r"2160p|4K\b", re.I)),
+    ("1080p", re.compile(r"1080[pi]", re.I)),
+    ("720p", re.compile(r"720p", re.I)),
+    ("480p", re.compile(r"480p", re.I)),
+]
+SOURCE_RE = re.compile(r"WEB-?DL|WEB-?Rip|BluRay|BDMV|Remux|HDTV|DVD|WEB", re.I)
+CODEC_RE = re.compile(r"H\.?26[56]|x26[45]|HEVC|AV1|VC-?1", re.I)
+HDR_RE = re.compile(r"HDR10\+|HDR|HLG|DoVi|Dolby[ .]?Vision|SDR", re.I)
+AUDIO_RE = re.compile(
+    r"TrueHD[ .]?Atmos|DTS-?X|DTS-?HD(?:[ .]?MA)?|DTS|E-?AC-?3|DDP|DD\+|AC-?3|FLAC|AAC|LPCM|MP3", re.I)
+CHAN_RE = re.compile(r"(?<!\d)([2568]\.[01])(?!\d)")
+
+
+def _is_movie_cat(cat):
+    return "电影" in (cat or "") or "院线" in (cat or "")
+
+
+def _media_info(c, title_info):
+    """遍历标题文件夹（最深 2 层），解析视频文件名得到画质/视频/音频/体积/集数。"""
+    names = []
+    all_size = 0
+    video_size = 0
+
+    def walk(pid, depth):
+        nonlocal all_size, video_size
+        if depth > 1:
+            return
+        try:
+            items = _list_dir(c, pid)
+        except Exception:
+            return
+        for it in items:
+            nm = it.get("FileName", "")
+            if it.get("Type") == 2:
+                sz = int(it.get("Size") or 0)
+                all_size += sz
+                if VIDEO_EXT_RE.search(nm):
+                    names.append(nm)
+                    video_size += sz
+            elif it.get("Type") == 1:
+                walk(it.get("FileId"), depth + 1)
+
+    walk(title_info["file_id"], 0)
+    blob = " ".join(names)
+    if not names:
+        return None
+    info = {}
+    size = video_size or all_size
+    if size > 0:
+        info["size_gb"] = "%.2f" % (size / 1024 ** 3)
+    for label, rex in QUALITY_RES:
+        if rex.search(blob):
+            info["quality"] = label
+            break
+    src = SOURCE_RE.search(blob)
+    codec = CODEC_RE.search(blob)
+    hdr = HDR_RE.search(blob)
+    video = " ".join(x for x in [src and src.group(0), codec and codec.group(0), hdr and hdr.group(0)] if x)
+    if video:
+        info["video"] = video
+    aud = AUDIO_RE.search(blob)
+    if aud:
+        chan = CHAN_RE.search(blob)
+        a = aud.group(0)
+        if "Atmos" in blob and "Atmos" not in a:
+            a += " Atmos"
+        info["audio"] = (a + (" " + chan.group(1) if chan else ""))[:24]
+    cat = _derive_category(title_info["path"])
+    if not _is_movie_cat(cat):
+        eps = [int(m.group(1)) for m in (EP_RE.search(n) for n in names) if m]
+        if not eps:
+            eps = [int(m.group(1)) for m in (EP_CN_RE.search(n) for n in names) if m]
+        if eps:
+            info["episodes"] = "更新至 %d 集" % max(eps)
+        else:
+            info["episodes"] = "共 %d 个视频" % len(names)
+    return info
+
+
+def _tmdb_info(env, title_info, category):
+    """按文件夹名里的 {tmdb-xxxx} id 抓 TMDB 中文资料；返回 None 表示不可用。"""
+    key = env.get("ENV_TMDB_API_KEY")
+    if not key:
+        return None
+    tm = TMDB_RE.search(title_info["name"])
+    if not tm:
+        return None
+    m = re.search(r"(\d+)", tm.group(0))
+    if not m:
+        return None
+    tid = m.group(1)
+    base = (env.get("ENV_TMDB_API_BASE_URL") or "https://api.themoviedb.org/3").rstrip("/")
+    if "/3" not in base:
+        base = base + "/3"
+    img = (env.get("ENV_TMDB_IMAGE_BASE_URL") or "https://image.tmdb.org/t/p").rstrip("/")
+    order = ["movie", "tv"] if _is_movie_cat(category) else ["tv", "movie"]
+    for kind in order:
+        url = "%s/%s/%s?language=zh-CN&api_key=%s" % (base, kind, tid, key)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            return None
+        except Exception:
+            return None
+        if not d or d.get("success") is False:
+            continue
+        poster = d.get("poster_path") or ""
+        return {
+            "kind": kind,
+            "name": d.get("title") or d.get("name") or "",
+            "overview": (d.get("overview") or "").strip(),
+            "vote": d.get("vote_average") or 0,
+            "date": d.get("release_date") or d.get("first_air_date") or "",
+            "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
+            "poster_url": (img + "/w500" + poster) if poster else "",
+        }
+    return None
+
+
+def _bot_send_photo(token, chat_id, photo, caption_html):
+    """sendPhoto + HTML caption；失败抛异常由调用方回退。"""
+    url = "https://api.telegram.org/bot%s/sendPhoto" % token
+    data = json.dumps({
+        "chat_id": chat_id, "photo": photo,
+        "caption": caption_html[:1024], "parse_mode": "HTML",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _rich_parts(title_info, url, pwd, media, tinfo):
+    """构造富文本消息。返回 (纯文本, HTML卡片文案或None)。"""
+    title, year, _ = _parse_title(title_info["name"])
+    cat = _derive_category(title_info["path"])
+    name_line = "%s (%s)" % (title, year) if year else title
+    lines = ["🎬 名称：" + name_line]
+    if cat:
+        lines.append("📂 类型：" + cat)
+    if media:
+        if media.get("quality"):
+            lines.append("🖥 画质：" + media["quality"])
+        if media.get("video"):
+            lines.append("🎥 视频：" + media["video"])
+        if media.get("audio"):
+            lines.append("🎧 音频：" + media["audio"])
+        if media.get("size_gb"):
+            lines.append("📦 大小：%s GB" % media["size_gb"])
+        if media.get("episodes"):
+            lines.append("🎞 集数：%s" % media["episodes"])
+    if tinfo:
+        try:
+            if tinfo.get("vote"):
+                lines.append("⭐ TMDB评分：%.1f/10" % float(tinfo["vote"]))
+        except (TypeError, ValueError):
+            pass
+        if tinfo.get("date"):
+            lines.append("📅 播出日期：" + tinfo["date"])
+        gs = tinfo.get("genres") or []
+        if gs:
+            lines.append("🏷 标签：" + " ".join("#" + g for g in gs[:4]))
+    overview = (tinfo or {}).get("overview") or ""
+    if overview:
+        short = overview[:120] + ("…" if len(overview) > 120 else "")
+        lines.append("")
+        lines.append("📝 简介：")
+        lines.append(short)
+    lines.append("")
+    lines.append("🔗 链接：" + (url or ""))
+    if pwd:
+        lines.append("🔑 提取码：" + pwd)
+    plain = "\n".join(lines)
+
+    html_cap = None
+    if tinfo and tinfo.get("poster_url"):
+        h = ["🎬 <b>%s</b>" % _html.escape(name_line)]
+        if cat:
+            h.append("📂 类型：%s" % _html.escape(cat))
+        if media:
+            if media.get("quality"):
+                h.append("🖥 画质：%s" % _html.escape(media["quality"]))
+            if media.get("video"):
+                h.append("🎥 视频：%s" % _html.escape(media["video"]))
+            if media.get("audio"):
+                h.append("🎧 音频：%s" % _html.escape(media["audio"]))
+            if media.get("size_gb"):
+                h.append("📦 大小：%s GB" % media["size_gb"])
+            if media.get("episodes"):
+                h.append("🎞 集数：%s" % _html.escape(media["episodes"]))
+        if tinfo:
+            try:
+                if tinfo.get("vote"):
+                    h.append("⭐ TMDB评分：%.1f/10" % float(tinfo["vote"]))
+            except (TypeError, ValueError):
+                pass
+            if tinfo.get("date"):
+                h.append("📅 播出日期：%s" % _html.escape(tinfo["date"]))
+            gs = tinfo.get("genres") or []
+            if gs:
+                h.append("🏷 标签：%s" % " ".join("#" + _html.escape(g) for g in gs[:4]))
+        if overview:
+            short = overview[:110] + ("…" if len(overview) > 110 else "")
+            h.append("")
+            h.append("📝 简介：")
+            h.append("<blockquote>%s</blockquote>" % _html.escape(short))
+        h.append("")
+        h.append('🔗 <a href="%s">点击保存到 123 云盘</a>' % _html.escape(url or ""))
+        if pwd:
+            h.append("🔑 提取码：<code>%s</code>" % _html.escape(pwd))
+        html_cap = "\n".join(h)
+    return plain, html_cap
 
 
 # ---------------------- pan1.me 资源社区发帖 ----------------------
@@ -650,12 +885,31 @@ def _forum_subject(title_info):
     return s.strip()[:100]
 
 
-def _forum_message(title_info, pwd, cat):
+def _forum_message(title_info, pwd, cat, media=None, tinfo=None):
     title, year, _ = _parse_title(title_info["name"])
     head = "《%s》%s" % (title, " (%s)" % year if year else "")
     lines = [head]
     if cat:
         lines.append("分类：%s" % cat)
+    if media:
+        spec = " ".join(x for x in [media.get("quality"), media.get("video"), media.get("audio")] if x)
+        if spec:
+            lines.append("规格：%s" % spec)
+        if media.get("size_gb"):
+            lines.append("体积：%s GB" % media["size_gb"])
+        if media.get("episodes"):
+            lines.append("集数：%s" % media["episodes"])
+    if tinfo:
+        try:
+            if tinfo.get("vote"):
+                lines.append("TMDB评分：%.1f/10" % float(tinfo["vote"]))
+        except (TypeError, ValueError):
+            pass
+        if tinfo.get("date"):
+            lines.append("播出日期：%s" % tinfo["date"])
+        overview = (tinfo.get("overview") or "").strip()
+        if overview:
+            lines.append("简介：%s%s" % (overview[:150], "…" if len(overview) > 150 else ""))
     if pwd:
         lines.append("提取码：%s" % pwd)
     return "\n".join(lines)
@@ -791,6 +1045,7 @@ def run(params, context):
     forum_link_field = (params.get("forum_link_field") or "http_url").strip()
     forum_dedup = bool(params.get("forum_dedup", True))
     template = params.get("template") or DEFAULT_TEMPLATE
+    rich_enabled = bool(params.get("rich_message", True))
     include = _lines(params.get("media_include"))
     exclude = _lines(params.get("media_exclude"))
     token = env.get("ENV_TG_BOT_TOKEN")
@@ -900,10 +1155,33 @@ def run(params, context):
             traceback.print_exc()
             continue
         msg = _build_message(t, url, diy_pwd, template)
+        media = None
+        tinfo = None
+        if rich_enabled:
+            try:
+                media = _media_info(client, t)
+            except Exception as e:
+                print("媒体信息解析失败 %s: %s" % (t.get("name"), e))
+            try:
+                tinfo = _tmdb_info(env, t, _derive_category(t["path"]))
+            except Exception as e:
+                print("TMDB 获取失败 %s: %s" % (t.get("name"), e))
+            if media or tinfo:
+                plain_msg, html_cap = _rich_parts(t, url, diy_pwd, media, tinfo)
+                msg = plain_msg
         posted = False
         if post_enabled and chat_id:
             try:
-                _bot_send(token, chat_id, msg)
+                sent_photo = False
+                if rich_enabled and tinfo and tinfo.get("poster_url"):
+                    try:
+                        _, cap = _rich_parts(t, url, diy_pwd, media, tinfo)
+                        _bot_send_photo(token, chat_id, tinfo["poster_url"], cap)
+                        sent_photo = True
+                    except Exception as pe:
+                        print("海报卡片发送失败，回退文本 %s: %s" % (t.get("name"), pe))
+                if not sent_photo:
+                    _bot_send(token, chat_id, msg)
                 posted = True
             except Exception as e:
                 print("发送失败(群) %s: %s" % (t.get("name"), e))
@@ -924,7 +1202,7 @@ def run(params, context):
                     cat = _derive_category(t["path"])
                     fid = _category_to_fid(cat, forum_fid)
                     subject = _forum_subject(t)
-                    fmsg = _forum_message(t, diy_pwd, cat)
+                    fmsg = _forum_message(t, diy_pwd, cat, media, tinfo)
                     pub = _forum_publish(forum_session, forum_base, fid, subject,
                                          fmsg, forum_link_field, url, t["name"])
                     found = _forum_find(forum_session, forum_base, forum_uid, subject)

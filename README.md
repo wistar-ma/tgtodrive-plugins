@@ -6,7 +6,7 @@ TgtoDrive「实用工具 → 我的插件」的插件仓库（符合官方插件
 
 | 插件 | 说明 | 版本 |
 | --- | --- | --- |
-| [整理后自动分享](plugins/organize-share/plugin.py) | 影视整理完成后自动生成 123 云盘分享链接并发送到 Telegram 群 + pan1.me 论坛 | 1.0.2 |
+| [整理后自动分享](plugins/organize-share/plugin.py) | 影视整理完成后自动生成 123 云盘分享链接并发送到 Telegram 群 + pan1.me 论坛 | 1.0.3 |
 
 ## 安装方式
 
