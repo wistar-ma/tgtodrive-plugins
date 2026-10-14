@@ -33,7 +33,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -293,11 +293,12 @@ def _get_client(env):
 
 def _list_dir(c, pid):
     items = []
-    last = None
+    nxt = 0
+    pages = 0
     while True:
         payload = {"parentFileId": pid, "limit": 100}
-        if last is not None:
-            payload["lastFileId"] = last
+        if nxt:
+            payload["next"] = nxt
         res = c.fs_list(payload, base_url=WEB_BASE)
         data = res.get("data") or {}
         info = data.get("InfoList") or []
@@ -307,11 +308,12 @@ def _list_dir(c, pid):
             if it.get("trashed"):
                 continue
             items.append(it)
-        lf = data.get("lastFileId")
-        if lf in (None, "-1"):
+        n = data.get("Next")
+        if n in (None, "", "-1", 0):
             break
-        last = lf
-        if len(items) > 50000:
+        nxt = n
+        pages += 1
+        if pages > 200 or len(items) > 50000:
             break
     return items
 
