@@ -35,7 +35,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.14",
+    "version": "1.0.15",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -228,6 +228,7 @@ PLUGIN_MANIFEST = {
         "layout": "stack",
         "components": [
             {"type": "alert", "text": "首次使用：把机器人 @OracleTgto123_Bot 拉进目标群并在群里发消息，用「获取群ID」模式拿到 chat_id 填入上方。再在「我的插件→定时执行」里配 cron（如 */3 * * * *）即可自动扫描。", "style": {"tone": "warning"}},
+            {"type": "alert", "text": "查询记录：每次运行后会在本插件数据目录自动生成可查询记录页 records.html。容器内路径 /app/db/toolbox/plugins/organize-share/data/records.html（随 /app/db 绑定挂载，宿主机即 <TgtoDrive>/db/toolbox/plugins/organize-share/data/records.html）。用浏览器打开即可搜索/筛选/导出；也可下载到本地打开。", "style": {"tone": "info"}},
             {"type": "heading", "text": "运行与发送"},
             {"type": "field", "name": "mode"},
             {"type": "field", "name": "chat_id"},
@@ -1956,6 +1957,11 @@ def run(params, context):
         ("已通知" if r["posted"] else "未通知") + "/" + (r.get("community_info") or ""),
     ] for r in upd_results[:50]]
     components = [
+        {
+            "type": "alert",
+            "text": "查询记录页已更新：%s（用浏览器打开可搜索/筛选/导出 CSV）" % str(records_path),
+            "style": {"tone": "info"},
+        },
         {
             "type": "table",
             "label": "本次新增处理结果",
