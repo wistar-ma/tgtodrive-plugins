@@ -16,6 +16,7 @@ ENV_TG_BOT_TOKEN / ENV_DIY_LINK_PWD / ENV_123_ORGANIZE_TARGET_PID）。
 import os
 import re
 import html as _html
+import hashlib
 import json
 import time
 import traceback
@@ -34,12 +35,14 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.12",
+    "version": "1.0.14",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
         "首次运行只记录基线（不发群），避免历史刷屏。支持快速/全量扫描、回填补发、试运行、获取群 chat_id。"
         "可通过开关把每个新分享发布到 pan1.me 资源社区（Xiuno 论坛主题帖，带标题去重）。"
+        "内置「一标题一链接一帖子」：已分享标题内容有更新时，复用原分享链接发更新通知并原地更新原社区帖，"
+        "不新增链接、不新增帖子；并在数据目录自动生成可查询记录页 records.html。"
     ),
     "author": "wistar",
     "entry": "plugin.py",
@@ -180,6 +183,22 @@ PLUGIN_MANIFEST = {
             "help": "发帖前拉取「我的主题」，若已存在同题帖（含 TgtoDrive 自带发帖）则跳过，避免重复刷帖。",
         },
         {
+            "name": "update_notify",
+            "label": "标题更新时发 TG 通知",
+            "type": "switch",
+            "required": False,
+            "default": True,
+            "help": "检测到已分享过的标题有新集/规格变化时，向 TG 群发「更新」通知，并沿用原有分享链接（不重新建链）。",
+        },
+        {
+            "name": "update_post",
+            "label": "标题更新时原地更新社区帖",
+            "type": "switch",
+            "required": False,
+            "default": True,
+            "help": "检测到更新时，原地更新该标题已有的社区帖（标题/正文/标签），不新建帖子；查不到原帖时才新建。",
+        },
+        {
             "name": "merge_pwd",
             "label": "提取码并入链接",
             "type": "switch",
@@ -226,6 +245,8 @@ PLUGIN_MANIFEST = {
             {"type": "field", "name": "forum_fid"},
             {"type": "field", "name": "forum_link_field"},
             {"type": "field", "name": "forum_dedup"},
+            {"type": "field", "name": "update_notify"},
+            {"type": "field", "name": "update_post"},
             {"type": "field", "name": "merge_pwd"},
             {"type": "field", "name": "rich_message"},
             {"type": "field", "name": "template"},
@@ -389,7 +410,8 @@ def _collect_titles_from_container(c, pid, path, out):
         if not fid:
             continue
         if _is_title(name):
-            out.append({"file_id": fid, "name": name, "path": path + [name]})
+            out.append({"file_id": fid, "name": name, "path": path + [name],
+                        "size": int(it.get("Size") or 0), "update_at": it.get("UpdateAt") or ""})
 
 
 def _collect_titles_fast(c, target_pid, year_threshold, include, exclude):
@@ -431,7 +453,8 @@ def _collect_titles_full(c, pid, path, out, depth=0, max_depth=5, include=None, 
         if not fid:
             continue
         if _is_title(name):
-            out.append({"file_id": fid, "name": name, "path": path + [name]})
+            out.append({"file_id": fid, "name": name, "path": path + [name],
+                        "size": int(it.get("Size") or 0), "update_at": it.get("UpdateAt") or ""})
             continue
         if not _media_pass(name, include, exclude):
             continue
@@ -536,8 +559,9 @@ def _is_movie_cat(cat):
 
 
 def _media_info(c, title_info):
-    """遍历标题文件夹（最深 2 层），解析视频文件名得到画质/视频/音频/体积/集数。"""
+    """遍历标题文件夹（最深 2 层），解析视频文件名得到画质/视频/音频/体积/集数，并给出内容签名 _sig。"""
     names = []
+    sig_pairs = []
     all_size = 0
     video_size = 0
 
@@ -570,6 +594,7 @@ def _media_info(c, title_info):
                 all_size += sz
                 if VIDEO_EXT_RE.search(nm):
                     names.append(nm)
+                    sig_pairs.append((nm, sz))
                     video_size += sz
 
     walk(title_info["file_id"], 0)
@@ -577,6 +602,11 @@ def _media_info(c, title_info):
     if not names:
         return None
     info = {}
+    # 内容签名：视频文件名+体积排序后哈希（集数/规格变化即变化）
+    info["_sig"] = hashlib.md5(
+        "|".join("%s:%d" % (n, s) for n, s in sorted(sig_pairs)).encode("utf-8")
+    ).hexdigest()
+    info["video_count"] = len(names)
     size = video_size or all_size
     if size > 0:
         info["size_gb"] = "%.2f" % (size / 1024 ** 3)
@@ -1188,6 +1218,49 @@ def _forum_find(session, base, uid, subject):
     return None
 
 
+def _forum_first_pid(session, base, tid):
+    """取主题「首帖」pid（改帖用）：从帖页里找 post-update-/post-delete- 链接。"""
+    try:
+        h = session.get(base + "/?thread-%s.htm" % tid, timeout=30).text
+    except Exception:
+        return None
+    m = re.search(r"post-update-(\d+)\.htm", h) or re.search(r"post-delete-(\d+)\.htm", h)
+    return m.group(1) if m else None
+
+
+def _forum_update(session, base, pid, subject, message, name_hint=None, quality=None):
+    """原地更新已有帖子：GET 编辑表单取 fid/标签 → POST ?post-update-{pid}.htm（不新建主题）。"""
+    subject = _forum_safe(subject)
+    message = _forum_safe(message)
+    try:
+        form = session.get(base + "/?post-update-%s.htm" % pid, timeout=30)
+    except Exception as e:
+        return {"ok": False, "error": "取编辑表单失败: %s" % e}
+    eh = form.text
+    mf = re.search(r'name="fid"[^>]*value="([^"]*)"', eh)
+    fid = mf.group(1) if mf else ""
+    tags_by_fid = _forum_parse_tags(eh)
+    tagids = _forum_pick_tags(tags_by_fid, fid, name_hint, quality) if (tags_by_fid and fid) else None
+    data = {"doctype": "0", "quotepid": "0", "fid": fid, "subject": subject, "message": message}
+    if tagids:
+        data["tagid[]"] = tagids
+    try:
+        r = session.post(base + "/?post-update-%s.htm" % pid, data=data,
+                         headers={"Referer": base + "/?post-update-%s.htm" % pid},
+                         timeout=45, allow_redirects=True)
+    except Exception as e:
+        return {"ok": False, "error": "改帖请求失败: %s" % e}
+    info = {"ok": True, "http": r.status_code, "tagids": tagids, "fid": fid,
+            "final_url": r.url, "snippet": re.sub(r"\s+", " ", r.text)[:160]}
+    try:
+        j = json.loads(r.text)
+        info["code"] = j.get("code")
+        info["message"] = j.get("message")
+    except Exception:
+        pass
+    return info
+
+
 def _get_chat_id(token):
     url = "https://api.telegram.org/bot%s/getUpdates" % token
     try:
@@ -1246,6 +1319,236 @@ def _get_chat_id(token):
 
 
 # ---------------------- 入口 ----------------------
+RECORDS_HTML_TPL = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>分享记录 · 信息维护</title>
+<style>
+  :root{--bg:#0f1720;--panel:#16202b;--line:#26333f;--txt:#e6edf3;--sub:#8b98a5;
+        --accent:#2dd4bf;--accent2:#38bdf8;--muted:#334155;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  header{position:sticky;top:0;z-index:10;background:rgba(15,23,32,.92);backdrop-filter:blur(8px);
+         border-bottom:1px solid var(--line);padding:16px 20px}
+  .top{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0;letter-spacing:.5px}
+  h1 .dot{color:var(--accent)}
+  .stat{margin-left:auto;color:var(--sub);font-size:13px}
+  .stat b{color:var(--accent);font-size:16px}
+  .bar{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  input,select,button{background:var(--panel);color:var(--txt);border:1px solid var(--line);
+        border-radius:8px;padding:8px 12px;font-size:13px;outline:none}
+  input:focus,select:focus{border-color:var(--accent)}
+  #q{flex:1;min-width:220px}
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  .wrap{padding:0 20px 40px}
+  table{width:100%;border-collapse:collapse;margin-top:12px}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{position:sticky;top:118px;background:var(--panel);color:var(--sub);font-weight:600;
+     font-size:12px;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;white-space:nowrap}
+  tbody tr:hover{background:#1b2733}
+  .t-title{font-weight:600}
+  .t-year{color:var(--sub);font-weight:400}
+  .cat{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--muted);
+       color:#cbd5e1;font-size:12px;white-space:nowrap}
+  a{color:var(--accent2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .link-cell{display:flex;align-items:center;gap:8px;white-space:nowrap}
+  .copy{border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--sub)}
+  .copy:hover{color:var(--accent);border-color:var(--accent)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap}
+  .b-ok{background:rgba(34,197,94,.15);color:#4ade80}
+  .b-tg{background:rgba(56,189,248,.15);color:#7dd3fc}
+  .b-link{background:rgba(148,163,184,.15);color:#cbd5e1}
+  .time{color:var(--sub);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .none{color:#64748b}
+  .empty{padding:40px;text-align:center;color:var(--sub)}
+  @media(max-width:820px){th:nth-child(2),td:nth-child(2){display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>分享记录<span class="dot"> · </span>信息维护</h1>
+    <div class="stat">共 <b id="total">0</b> 条 / 显示 <b id="shown">0</b> 条</div>
+  </div>
+  <div class="bar">
+    <input id="q" placeholder="搜索：片名 / 分类 / 分享链接 …">
+    <select id="cat"><option value="">全部分类</option></select>
+    <select id="st">
+      <option value="">全部状态</option>
+      <option value="已发帖">已发帖</option>
+      <option value="仅TG群">仅TG群</option>
+      <option value="仅建链">仅建链</option>
+    </select>
+    <button id="csv">导出 CSV</button>
+  </div>
+</header>
+<div class="wrap">
+  <table>
+    <thead><tr>
+      <th data-k="title">视频</th>
+      <th data-k="category">分类</th>
+      <th>分享链接</th>
+      <th>帖子链接</th>
+      <th data-k="status">状态</th>
+      <th data-k="ts">更新时间</th>
+    </tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">没有匹配的记录</div>
+</div>
+<script>
+const ROWS = __DATA__;
+const fmt = ts => { if(!ts) return ""; const d=new Date(ts*1000);
+  const p=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes()); };
+const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let sortK="ts", sortDir=-1;
+function fillCats(){
+  const cats=[...new Set(ROWS.map(r=>r.category).filter(Boolean))].sort();
+  const sel=document.getElementById("cat");
+  cats.forEach(c=>{const o=document.createElement("option");o.value=c;o.textContent=c;sel.appendChild(o);});
+}
+function current(){
+  const q=document.getElementById("q").value.trim().toLowerCase();
+  const cat=document.getElementById("cat").value;
+  const st=document.getElementById("st").value;
+  let out=ROWS.filter(r=>{
+    if(cat && r.category!==cat) return false;
+    if(st && r.status!==st) return false;
+    if(q){const hay=(r.title+" "+r.name+" "+r.category+" "+r.share+" "+(r.year||"")).toLowerCase();
+      if(!hay.includes(q)) return false;}
+    return true;
+  });
+  out.sort((a,b)=>{let x=a[sortK],y=b[sortK];
+    if(sortK==="title"){return sortDir*(String(x).localeCompare(String(y),"zh"));}
+    return sortDir*((x<y)-(x>y));});
+  return out;
+}
+function render(){
+  const rows=current();
+  const tb=document.getElementById("tb");
+  tb.innerHTML=rows.map(r=>{
+    const shareCell = r.share_full
+      ? `<div class="link-cell"><a href="${esc(r.share_full)}" target="_blank" rel="noopener">${esc(r.share)}</a>
+         <span class="copy" data-copy="${esc(r.share_full)}">复制</span></div>`
+      : `<span class="none">—</span>`;
+    const forumCell = r.forum
+      ? `<a href="${esc(r.forum)}" target="_blank" rel="noopener">打开帖子</a>`
+      : `<span class="none">—</span>`;
+    const cls = r.status==="已发帖"?"b-ok":(r.status==="仅TG群"?"b-tg":"b-link");
+    return `<tr>
+      <td><div class="t-title">${esc(r.title)} <span class="t-year">${esc(r.year)}</span></div></td>
+      <td><span class="cat">${esc(r.category)}</span></td>
+      <td>${shareCell}</td>
+      <td>${forumCell}</td>
+      <td><span class="badge ${cls}">${esc(r.status)}</span></td>
+      <td class="time">${fmt(r.ts)}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("shown").textContent=rows.length;
+  document.getElementById("total").textContent=ROWS.length;
+  document.getElementById("empty").style.display=rows.length?"none":"block";
+}
+document.querySelectorAll("th[data-k]").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k;
+  if(sortK===k) sortDir=-sortDir; else {sortK=k; sortDir=(k==="ts")?-1:1;}
+  render();
+});
+document.getElementById("q").oninput=render;
+document.getElementById("cat").onchange=render;
+document.getElementById("st").onchange=render;
+document.getElementById("tb").addEventListener("click",e=>{
+  const t=e.target.closest(".copy"); if(!t) return;
+  navigator.clipboard.writeText(t.dataset.copy).then(()=>{const o=t.textContent;t.textContent="已复制";setTimeout(()=>t.textContent=o,1200);});
+});
+document.getElementById("csv").onclick=()=>{
+  const rows=current();
+  const head=["视频","年份","分类","分享链接","帖子链接","状态","更新时间"];
+  const lines=[head.join(",")].concat(rows.map(r=>[r.title,r.year,r.category,r.share_full,r.forum,r.status,fmt(r.ts)]
+    .map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")));
+  const blob=new Blob(["\ufeff"+lines.join("\r\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download="分享记录.csv";a.click();URL.revokeObjectURL(a.href);
+};
+fillCats(); render();
+</script>
+</body>
+</html>
+"""
+
+
+def _records_rows(state, pwd):
+    """从 state 提取「已建链」标题记录，倒序（新在前）。"""
+    rows = []
+    for fid, node in state.items():
+        if fid == "__meta__" or not isinstance(node, dict):
+            continue
+        url = node.get("share_url")
+        if not url:
+            continue
+        name = node.get("name") or ""
+        title = re.sub(r"\s*\{tmdb-[^}]*\}\s*", "", name).strip()
+        ym = re.search(r"\((\d{4})\)", name)
+        year = ym.group(1) if ym else ""
+        try:
+            cat = _derive_category(node.get("path") or [])
+        except Exception:
+            cat = ""
+        share_full = ("%s?pwd=%s" % (url, pwd)) if (url and pwd) else url
+        tid = str(node.get("community_tid") or "")
+        if not tid:
+            m = re.search(r"#(\d+)", node.get("community_info") or "")
+            tid = m.group(1) if m else ""
+        forum = ("https://pan1.me/?thread-%s.htm" % tid) if tid else ""
+        if node.get("community_posted"):
+            status = "已发帖"
+        elif node.get("posted"):
+            status = "仅TG群"
+        else:
+            status = "仅建链"
+        rows.append({
+            "title": title, "year": year, "name": name, "category": cat,
+            "share": url, "share_full": share_full, "forum": forum,
+            "status": status, "ts": node.get("updated_ts") or node.get("ts") or 0,
+            "updates": int(node.get("updates") or 0),
+        })
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows
+
+
+def _write_records_html(path, state, pwd):
+    """生成自包含、可搜索的记录页 records.html（内嵌全部已建链记录）。返回记录条数。"""
+    rows = _records_rows(state, pwd)
+    payload = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
+    html = RECORDS_HTML_TPL.replace("__DATA__", payload)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(html)
+    os.replace(tmp, str(path))
+    return len(rows)
+
+
+def _update_notice_head(title_info, media):
+    """更新通知的标题行：明确「已更新 + 复用原链接」，让群里一眼识别是更新而非新资源。"""
+    title, year, _ = _parse_title(title_info["name"])
+    name = "%s (%s)" % (title, year) if year else title
+    bits = []
+    if media:
+        if media.get("episodes"):
+            bits.append(media["episodes"])
+        if media.get("size_gb"):
+            bits.append("%s GB" % media["size_gb"])
+    extra = ("｜" + " · ".join(bits)) if bits else ""
+    return ("🔄 资源更新：%s%s\n（分享链接保持不变，已同步更新社区帖，请勿重复转存旧链接）"
+            % (name, extra))
+
+
 def run(params, context):
     env = _load_env()
     data_dir = Path(context["data_dir"])
@@ -1275,6 +1578,8 @@ def run(params, context):
         full_every = 20
     post_enabled = bool(params.get("post_enabled", True))
     community_enabled = bool(params.get("community_enabled", False))
+    update_notify = bool(params.get("update_notify", True))
+    update_post = bool(params.get("update_post", True))
     forum_fid = (params.get("forum_fid") or "auto").strip()
     forum_link_field = (params.get("forum_link_field") or "http_url").strip()
     forum_dedup = bool(params.get("forum_dedup", True))
@@ -1427,6 +1732,7 @@ def run(params, context):
         elif not post_enabled:
             print("post_enabled=false，仅建链未发送: %s" % t["name"])
         community_posted = False
+        community_tid = None
         community_info = "未发社区"
         if community_enabled:
             title_core = _parse_title(t["name"])[0]
@@ -1447,6 +1753,7 @@ def run(params, context):
                     if found:
                         tid, turl = found
                         community_posted = True
+                        community_tid = str(tid)
                         community_info = "已发社区(%s) #%s" % (
                             FORUM_FID_NAMES.get(str(forum_fid_sel), "fid=%s" % forum_fid_sel), tid)
                         forum_titles.append((tid, subject))
@@ -1462,6 +1769,12 @@ def run(params, context):
             "name": t["name"], "path": t["path"], "share_key": key,
             "share_url": url, "posted": posted,
             "community_posted": community_posted, "community_info": community_info,
+            "community_tid": community_tid, "community_pid": None,
+            "sig": (media or {}).get("_sig"),
+            "video_count": (media or {}).get("video_count"),
+            "episodes": (media or {}).get("episodes"),
+            "dir_size": t.get("size"), "dir_update_at": t.get("update_at"),
+            "pwd": diy_pwd, "updated_ts": 0, "updates": 0,
             "ts": int(time.time()),
         }
         processed += 1
@@ -1469,37 +1782,208 @@ def run(params, context):
                         "community_posted": community_posted,
                         "community_info": community_info})
 
+    # ---------- 更新检测：同一标题只保留「一条分享链接 + 一个帖子」，更新时复用 ----------
+    # 1) 先用低成本信号（容器聚合体积/更新时间）筛出疑似变更，避免每轮深扫
+    suspicious = []
+    for t in out:
+        fid = str(t["file_id"])
+        st = state.get(fid)
+        if not st or not st.get("share_url"):
+            continue
+        prev_size, prev_upd = st.get("dir_size"), st.get("dir_update_at")
+        cur_size, cur_upd = t.get("size"), t.get("update_at")
+        if prev_size is None and prev_upd is None:
+            # 老记录首次建立变更基线，不判更新
+            st["dir_size"], st["dir_update_at"] = cur_size, cur_upd
+            continue
+        if (cur_size != prev_size) or (cur_upd and cur_upd != prev_upd):
+            suspicious.append(t)
+
+    # 2) 对疑似项深扫算内容签名 _sig 确认，避免仅时间戳抖动造成误报
+    updates = []
+    for t in suspicious:
+        st = state.get(str(t["file_id"]))
+        try:
+            media = _media_info(client, t)
+        except Exception as e:
+            print("更新校验失败 %s: %s" % (t.get("name"), e))
+            continue
+        new_sig = media.get("_sig") if media else None
+        old_sig = st.get("sig")
+        if new_sig and old_sig and new_sig == old_sig:
+            st["dir_size"], st["dir_update_at"] = t.get("size"), t.get("update_at")
+            continue
+        if not new_sig:
+            continue
+        updates.append((t, media, new_sig))
+    if updates:
+        print("检测到标题更新 %d 个（复用原链接/原帖）" % len(updates))
+
+    upd_notified = 0
+    upd_posted = 0
+    upd_results = []
+    for t, media, new_sig in updates:
+        fid = str(t["file_id"])
+        st = state[fid]
+        url = st.get("share_url")
+        pwd_use = st.get("pwd") or diy_pwd
+        out_url = _merge_pwd(url, pwd_use) if merge_pwd else url
+        show_pwd = None if merge_pwd else pwd_use
+        tinfo = None
+        if rich_enabled:
+            try:
+                tinfo = _tmdb_info(env, t, _derive_category(t["path"]))
+            except Exception as e:
+                print("TMDB 获取失败(更新) %s: %s" % (t.get("name"), e))
+        head = _update_notice_head(t, media)
+
+        # (1) TG 更新通知：沿用原有分享链接，不重新建链
+        notified = False
+        if update_notify and post_enabled and chat_id and url:
+            try:
+                if rich_enabled and (media or tinfo):
+                    plain_msg, html_cap = _rich_parts(t, out_url, show_pwd, media, tinfo)
+                else:
+                    plain_msg, html_cap = _build_message(t, out_url, show_pwd, template), None
+                sent_photo = False
+                if rich_enabled and html_cap and tinfo and tinfo.get("poster_url"):
+                    try:
+                        _bot_send_photo(token, chat_id, tinfo["poster_url"], head + "\n" + html_cap)
+                        sent_photo = True
+                    except Exception as pe:
+                        print("更新海报卡片失败，回退文本 %s: %s" % (t.get("name"), pe))
+                if not sent_photo:
+                    _bot_send(token, chat_id, head + "\n\n" + plain_msg)
+                notified = True
+            except Exception as e:
+                print("更新通知发送失败 %s: %s" % (t.get("name"), e))
+
+        # (2) 原地更新社区帖（不新建）；若此前未发成功则用已有链接补发一帖
+        community_info = st.get("community_info") or "未发社区"
+        if update_post and community_enabled:
+            pid = st.get("community_pid")
+            tid = str(st.get("community_tid") or "")
+            if not tid:
+                # 老记录可能只在 community_info 里存了 #tid
+                mm = re.search(r"#(\d+)", st.get("community_info") or "")
+                tid = mm.group(1) if mm else ""
+            if st.get("community_posted") and not pid and tid:
+                pid = _forum_first_pid(forum_session, forum_base, tid)
+            if pid:
+                try:
+                    cat = _derive_category(t["path"])
+                    subject = _forum_subject(t, media)
+                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo, out_url, forum_link_field)
+                    res = _forum_update(forum_session, forum_base, pid, subject, fmsg,
+                                        t["name"], media.get("quality") if media else None)
+                    if res.get("ok"):
+                        st["community_pid"] = pid
+                        st["community_tid"] = tid or st.get("community_tid")
+                        upd_posted += 1
+                        community_info = "已更新社区帖#%s" % (tid or pid)
+                        print("社区改帖成功 %s pid=%s tags=%s" % (t.get("name"), pid, res.get("tagids")))
+                    else:
+                        community_info = "改帖失败: %s" % res.get("error")
+                        print("社区改帖失败 %s: %s" % (t.get("name"), res.get("error")))
+                except Exception as e:
+                    community_info = "改帖异常"
+                    print("社区改帖异常 %s: %s" % (t.get("name"), e))
+            elif not st.get("community_posted"):
+                try:
+                    cat = _derive_category(t["path"])
+                    forum_fid_sel = _category_to_fid(cat, forum_fid)
+                    subject = _forum_subject(t, media)
+                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo, out_url, forum_link_field)
+                    _forum_publish(forum_session, forum_base, forum_fid_sel, subject, fmsg,
+                                   forum_link_field, out_url, t["name"],
+                                   media.get("quality") if media else None)
+                    found = _forum_find(forum_session, forum_base, forum_uid, subject)
+                    if found:
+                        st["community_posted"] = True
+                        st["community_tid"] = str(found[0])
+                        upd_posted += 1
+                        community_info = "已补发社区#%s" % found[0]
+                        print("社区补发成功 %s -> tid=%s" % (t.get("name"), found[0]))
+                    else:
+                        community_info = "补发未确认"
+                except Exception as e:
+                    community_info = "补发异常"
+                    print("社区补发异常 %s: %s" % (t.get("name"), e))
+            else:
+                print("更新时未找到原帖 pid，跳过改帖：%s" % t.get("name"))
+
+        # (3) 回写状态：复用原 share_url/share_key，仅刷新内容签名与更新时间
+        st.update({
+            "sig": new_sig,
+            "video_count": (media or {}).get("video_count"),
+            "episodes": (media or {}).get("episodes"),
+            "dir_size": t.get("size"), "dir_update_at": t.get("update_at"),
+            "pwd": pwd_use, "community_info": community_info,
+            "updated_ts": int(time.time()),
+            "updates": int(st.get("updates") or 0) + 1,
+        })
+        if notified:
+            upd_notified += 1
+        upd_results.append({"name": t["name"], "url": out_url,
+                            "posted": notified, "community_info": community_info})
+
     meta["cycle"] = cycle
     if do_full:
         meta["last_full_scan"] = int(time.time())
     state["__meta__"] = meta
     _save_state(state_path, state)
 
+    # 生成/刷新可查询记录页（自包含 HTML，落在插件数据目录，容器外经 /app/db 绑定挂载可见）
+    records_path = data_dir / "records.html"
+    try:
+        _nr = _write_records_html(records_path, state, diy_pwd)
+        print("已生成记录页 %s（%d 条）" % (records_path, _nr))
+    except Exception as e:
+        print("生成记录页失败: %s" % e)
+
     sent = sum(1 for r in results if r["posted"])
     sent_comm = sum(1 for r in results if r.get("community_posted"))
     skipped_comm = sum(1 for r in results if r.get("community_info") == "去重跳过")
-    print("本次处理 %d 个，发群 %d 个，社区发帖 %d 个（去重跳过 %d）" % (
-        processed, sent, sent_comm, skipped_comm))
+    print("本次处理 %d 个，发群 %d 个，社区发帖 %d 个（去重跳过 %d）；更新复用 %d 个（通知 %d，改帖 %d）" % (
+        processed, sent, sent_comm, skipped_comm, len(upd_results), upd_notified, upd_posted))
     rows = [[
         r["name"], r["url"] or "",
         ("已发群" if r["posted"] else "未发群") + "/" + (
             r.get("community_info") or ("已发社区" if r.get("community_posted") else "未发社区")),
     ] for r in results[:50]]
+    upd_rows = [[
+        r["name"], r["url"] or "",
+        ("已通知" if r["posted"] else "未通知") + "/" + (r.get("community_info") or ""),
+    ] for r in upd_results[:50]]
+    components = [
+        {
+            "type": "table",
+            "label": "本次新增处理结果",
+            "headers": ["标题", "分享链接", "状态"],
+            "rows": rows,
+        }
+    ]
+    if upd_rows:
+        components.insert(0, {
+            "type": "alert",
+            "text": "本次检测到 %d 个标题更新，已复用原分享链接、原地更新原帖（未新增链接/帖子）。" % len(upd_results),
+            "style": {"tone": "info"},
+        })
+        components.append({
+            "type": "table",
+            "label": "更新复用结果",
+            "headers": ["标题", "分享链接(不变)", "状态"],
+            "rows": upd_rows,
+        })
     return {
         "新增标题": len(new),
         "本次处理": processed,
         "发送成功(群)": sent,
         "社区发帖成功": sent_comm,
         "社区去重跳过": skipped_comm,
-        "ui": {
-            "layout": "stack",
-            "components": [
-                {
-                    "type": "table",
-                    "label": "本次处理结果",
-                    "headers": ["标题", "分享链接", "状态"],
-                    "rows": rows,
-                }
-            ],
-        },
+        "标题更新复用": len(upd_results),
+        "更新通知(群)": upd_notified,
+        "更新改帖": upd_posted,
+        "记录页": str(records_path),
+        "ui": {"layout": "stack", "components": components},
     }
