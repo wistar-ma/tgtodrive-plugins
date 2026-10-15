@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.11",
+    "version": "1.0.12",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -1121,7 +1121,7 @@ def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None, link
             # 登录可见：pan1.me 用 tt_read 插件的 [ttlogin] 标记包裹链接写进正文
             parts.append(
                 '<div class="alert alert-info" role="alert" style="text-align:center;">'
-                '🔒 本资源分享链接需 <b>登录后</b> 可见。'
+                '【提示】本资源分享链接需 <b>登录后</b> 可见。'
                 '请您务必转存保存后再下载，以免消耗分享者免登流量。</div>')
             # URL 后必须留一个空格再闭合，避免论坛自动链接化把 [/ttlogin] 吞进链接
             parts.append('<p>[ttlogin]%s [/ttlogin]</p>' % _esc(link))
@@ -1130,16 +1130,25 @@ def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None, link
             # 回复/评论后论坛会自动展开显示链接
             parts.append(
                 '<div class="alert alert-warning" role="alert" style="text-align:center;">'
-                '🔒 本资源分享链接需 <b>回复 / 评论本帖</b> 后方可查看。'
+                '【提示】本资源分享链接需 <b>回复 / 评论本帖</b> 后方可查看。'
                 '请您务必先转存保存到自己的网盘，再下载，以免消耗分享者免登流量。</div>')
             # URL 后必须留一个空格再闭合，避免论坛自动链接化把 [/ttreply] 吞进链接
             parts.append('<p>[ttreply]%s [/ttreply]</p>' % _esc(link))
     return "\n".join(parts)
 
 
+def _forum_safe(s):
+    """pan1.me 论坛库字符集不支持 4 字节 UTF-8（emoji），发布前剥掉，避免显示成 ????。"""
+    if not s:
+        return s
+    return "".join(ch for ch in s if ord(ch) <= 0xFFFF)
+
+
 def _forum_publish(session, base, fid, subject, message, link_field, link, name_hint, quality=None):
     """发主题帖：先 GET 表单刷新会话并解析标签，选好各强制分类的 tagid，再 POST。
     注意：pan1.me 发帖成功不跳转到新主题（返回 200 表单页），成功与否由 _forum_find 查我的主题确认。"""
+    subject = _forum_safe(subject)
+    message = _forum_safe(message)
     form = session.get(base + "/?thread-create-0.htm", timeout=30)
     tags_by_fid = _forum_parse_tags(form.text)
     tagids = _forum_pick_tags(tags_by_fid, fid, name_hint, quality)
