@@ -2,8 +2,9 @@
 """TgtoDrive 工具箱插件：整理后自动分享
 
 TgtoDrive 影视整理完成后，扫描 123 云盘整理目标目录树，识别带 {tmdb} 的标题文件夹，
-为「新增」的剧/电影生成 123 云盘分享链接，并发送到指定 Telegram 群。
+为「新增」的剧/电影生成 123 云盘分享链接，并发送到指定 Telegram 群（含「已跟踪但从未建链、之后内容有变化」的补链）。
 仅新增标题会建链发群；首次运行只记录基线不发群，避免历史刷屏。
+「已跟踪但从未建链」的标题若之后内容有变化（如老剧新加集数），会按 first_link_max 上限补建链接。
 
 凭据取自同容器的 /app/db/user.env（ENV_123_CLIENT_ID / ENV_123_CLIENT_SECRET /
 ENV_TG_BOT_TOKEN / ENV_DIY_LINK_PWD / ENV_123_ORGANIZE_TARGET_PID）。
@@ -23,6 +24,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -35,7 +37,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.19",
+    "version": "1.0.20",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -209,6 +211,17 @@ PLUGIN_MANIFEST = {
             "help": "检测到更新时，原地更新该标题已有的社区帖（标题/正文/标签），不新建帖子；查不到原帖时才新建。",
         },
         {
+            "name": "first_link_max",
+            "label": "每轮最多补建链接数",
+            "type": "number",
+            "required": False,
+            "default": 20,
+            "min": 0,
+            "max": 200,
+            "step": 1,
+            "help": "针对「已存在但从未建过分享链接、且内容确实有变化」的标题（典型场景：老剧/老片开始跟踪后新加了集数或换了规格）自动补建一条分享链接并发群。每轮最多补几条，防止历史标题一次性刷屏；0=关闭该功能。",
+        },
+        {
             "name": "merge_pwd",
             "label": "提取码并入链接",
             "type": "switch",
@@ -260,6 +273,7 @@ PLUGIN_MANIFEST = {
             {"type": "field", "name": "forum_dedup"},
             {"type": "field", "name": "update_notify"},
             {"type": "field", "name": "update_post"},
+            {"type": "field", "name": "first_link_max"},
             {"type": "field", "name": "merge_pwd"},
             {"type": "field", "name": "rich_message"},
             {"type": "field", "name": "template"},
@@ -562,6 +576,23 @@ def _merge_pwd(url, pwd):
     if not url or not pwd:
         return url
     return "%s?pwd=%s" % (url, pwd)
+
+
+def _parse_iso_ts(value):
+    """把 123 目录的 UpdateAt（如 2026-07-10T13:21:36+08:00）转成 epoch 秒；失败返回 0。"""
+    if not value:
+        return 0
+    s = str(value).strip()
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(s[:19] if len(fmt) > 10 else s[:10], fmt).timestamp())
+        except Exception:
+            continue
+    return 0
 
 
 def _build_message(title_info, url, pwd, template, extra=None):
@@ -1668,6 +1699,11 @@ def run(params, context):
     rich_enabled = bool(params.get("rich_message", True))
     merge_pwd = bool(params.get("merge_pwd", True))
     records_url = (params.get("records_url") or "").strip()
+    try:
+        first_link_max = int(params.get("first_link_max", 20) or 0)
+    except Exception:
+        first_link_max = 20
+    first_link_max = max(0, min(200, first_link_max))
     include = _lines(params.get("media_include"))
     exclude = _lines(params.get("media_exclude"))
     token = env.get("ENV_TG_BOT_TOKEN")
@@ -1740,9 +1776,48 @@ def run(params, context):
             st = state.get(str(t["file_id"]))
             if st and not st.get("posted"):
                 todo.append(t)
+
+    # ---------- 首次补链 ----------
+    # 场景：某剧/电影在插件开始跟踪前就已存在（首轮只记了基线、没建链），之后又新加了集数/换了规格。
+    # 这类标题既不属于「新增」（fid 已在 state），也不会走「更新复用」（没有 share_url），
+    # 所以这里单独识别并补建它的第一条分享链接。
+    # 判定：① 已有变更基线 → 体积或更新时间与基线不同；② 还没有基线 → 目录更新时间晚于开始跟踪时间。
+    first_links = []
+    first_skipped = 0
+    if mode != "dry_run" and first_link_max > 0:
+        for t in out:
+            fid = str(t["file_id"])
+            st = state.get(fid)
+            if not st or st.get("share_url"):
+                continue
+            cur_size, cur_upd = t.get("size"), t.get("update_at")
+            prev_size, prev_upd = st.get("dir_size"), st.get("dir_update_at")
+            if prev_size is not None or prev_upd is not None:
+                changed = (cur_size != prev_size) or (bool(cur_upd) and cur_upd != prev_upd)
+            else:
+                upd_ts = _parse_iso_ts(cur_upd)
+                track_ts = int(st.get("ts") or 0)
+                changed = bool(upd_ts and track_ts and upd_ts > track_ts)
+            if not changed:
+                # 记下本次基线，下次真正有变化就能立刻认出
+                st["dir_size"], st["dir_update_at"] = cur_size, cur_upd
+                continue
+            if len(first_links) >= first_link_max:
+                first_skipped += 1  # 不落基线，留待下次运行继续补
+                continue
+            first_links.append(t)
+
     seen = set()
     todo = [t for t in todo if not (t["file_id"] in seen or seen.add(t["file_id"]))]
-    print("新增标题 %d 个，本次待处理 %d 个" % (len(new), len(todo)))
+    if first_links:
+        todo.extend(first_links)
+        seen2 = set()
+        todo = [t for t in todo if not (t["file_id"] in seen2 or seen2.add(t["file_id"]))]
+    print("新增标题 %d 个，首次补链 %d 个，本次待处理 %d 个" % (len(new), len(first_links), len(todo)))
+    if first_links:
+        print("首次补链名单：%s" % "、".join(t["name"] for t in first_links[:10]))
+    if first_skipped:
+        print("另有 %d 个可补链标题超出每轮上限 %d，将在后续运行继续" % (first_skipped, first_link_max))
 
     if mode == "dry_run":
         samples = [
@@ -2026,8 +2101,9 @@ def run(params, context):
     sent = sum(1 for r in results if r["posted"])
     sent_comm = sum(1 for r in results if r.get("community_posted"))
     skipped_comm = sum(1 for r in results if r.get("community_info") == "去重跳过")
-    print("本次处理 %d 个，发群 %d 个，社区发帖 %d 个（去重跳过 %d）；更新复用 %d 个（通知 %d，改帖 %d）" % (
-        processed, sent, sent_comm, skipped_comm, len(upd_results), upd_notified, upd_posted))
+    print("本次处理 %d 个（其中首次补链 %d 个），发群 %d 个，社区发帖 %d 个（去重跳过 %d）；更新复用 %d 个（通知 %d，改帖 %d）" % (
+        processed, len(first_links), sent, sent_comm, skipped_comm,
+        len(upd_results), upd_notified, upd_posted))
     rows = [[
         r["name"], r["url"] or "",
         ("已发群" if r["posted"] else "未发群") + "/" + (
@@ -2067,6 +2143,7 @@ def run(params, context):
         })
     return {
         "新增标题": len(new),
+        "首次补链": len(first_links),
         "本次处理": processed,
         "发送成功(群)": sent,
         "社区发帖成功": sent_comm,
