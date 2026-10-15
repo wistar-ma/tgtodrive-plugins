@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.8",
+    "version": "1.0.11",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -906,24 +906,36 @@ def _forum_parse_tags(html):
     return by_fid
 
 
-def _forum_pick_tags(tags_by_fid, fid, name_hint):
-    """每个强制标签分类选一个 tagid：优先名称命中 name_hint，其次「其他/其它」，再第一个。"""
+def _forum_pick_tags(tags_by_fid, fid, name_hint, quality=None):
+    """每个强制标签分类选一个 tagid：优先按真实画质 quality 匹配（如 4K），其次名称命中
+    name_hint，再「其他/其它」，最后第一个。quality 用于画质分类（标签名是画质串）。"""
     picked = []
     hint = (name_hint or "").lower()
+    q = (quality or "").strip().lower()
     for cat in tags_by_fid.get(str(fid), []):
         if not cat.get("isforce"):
             continue
         tags = cat["tags"]
         choice = None
-        for tid, name in tags:
-            if name and name.lower() in hint:
-                choice = tid
-                break
+        # 1) 画质优先：标签名精确等于实际画质（如 4K / 1080p / 2K）
+        if q:
+            for tid, name in tags:
+                if name and name.lower() == q:
+                    choice = tid
+                    break
+        # 2) name_hint 子串命中
+        if not choice:
+            for tid, name in tags:
+                if name and name.lower() in hint:
+                    choice = tid
+                    break
+        # 3) 「其他/其它」兜底
         if not choice:
             for tid, name in tags:
                 if name in ("其他", "其它", "Other", "other"):
                     choice = tid
                     break
+        # 4) 第一个
         if not choice and tags:
             choice = tags[0][0]
         if choice:
@@ -994,8 +1006,10 @@ def _forum_rewrite_domain(url):
     return re.sub(r"https?://[^/]+", FORUM_LINK_DOMAIN, url)
 
 
-def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None):
-    """论坛正文：参考 TgtoDrive 社区发帖格式——海报卡片 + 简介 + alert 链接区块（链接必须放正文）。"""
+def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None, link_field="message"):
+    """论坛正文：参考 TgtoDrive 社区发帖格式——海报卡片 + 简介。
+    链接放置：link_field=message 时链接直接写进正文；link_field=http_url(回复可见)/
+    vod_url(登录可见) 时正文化只放提示，真实链接由 _forum_publish 写入对应表单字段。"""
     title, year, _ = _parse_title(title_info["name"])
     link = _forum_rewrite_domain(link)
     if link and pwd and "pwd=" not in link:
@@ -1094,32 +1108,53 @@ def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None):
                 lines.append("简介：%s%s" % (overview[:200], "…" if len(overview) > 200 else ""))
         parts.append("<p>%s</p>" % _esc("\n".join(lines)).replace("\n", "<br/>"))
     if link:
-        # 分享链接区块（TgtoDrive 社区同款 alert-success）
-        parts.append(
-            '<div class="alert alert-success" role="alert">'
-            '<div style="text-align: center; color: red; font-weight: bold; margin-bottom: 10px;">'
-            '请您务必转存保存后再进行下载，以免消耗分享者的免登流量</div>'
-            '<hr style="margin: 10px 0;"> '
-            '<a href="%s" target="_blank"><span style="color:#0070c0;">%s</span></a>'
-            '</div>' % (_esc(link), _esc(link)))
+        if link_field == "message":
+            # 链接直接公开写在正文（TgtoDrive 社区同款 alert-success 区块）
+            parts.append(
+                '<div class="alert alert-success" role="alert">'
+                '<div style="text-align: center; color: red; font-weight: bold; margin-bottom: 10px;">'
+                '请您务必转存保存后再进行下载，以免消耗分享者的免登流量</div>'
+                '<hr style="margin: 10px 0;"> '
+                '<a href="%s" target="_blank"><span style="color:#0070c0;">%s</span></a>'
+                '</div>' % (_esc(link), _esc(link)))
+        elif link_field == "vod_url":
+            # 登录可见：pan1.me 用 tt_read 插件的 [ttlogin] 标记包裹链接写进正文
+            parts.append(
+                '<div class="alert alert-info" role="alert" style="text-align:center;">'
+                '🔒 本资源分享链接需 <b>登录后</b> 可见。'
+                '请您务必转存保存后再下载，以免消耗分享者免登流量。</div>')
+            # URL 后必须留一个空格再闭合，避免论坛自动链接化把 [/ttlogin] 吞进链接
+            parts.append('<p>[ttlogin]%s [/ttlogin]</p>' % _esc(link))
+        else:
+            # 回复可见（http_url）：pan1.me 用 tt_read 插件的 [ttreply] 标记包裹链接写进正文，
+            # 回复/评论后论坛会自动展开显示链接
+            parts.append(
+                '<div class="alert alert-warning" role="alert" style="text-align:center;">'
+                '🔒 本资源分享链接需 <b>回复 / 评论本帖</b> 后方可查看。'
+                '请您务必先转存保存到自己的网盘，再下载，以免消耗分享者免登流量。</div>')
+            # URL 后必须留一个空格再闭合，避免论坛自动链接化把 [/ttreply] 吞进链接
+            parts.append('<p>[ttreply]%s [/ttreply]</p>' % _esc(link))
     return "\n".join(parts)
 
 
-def _forum_publish(session, base, fid, subject, message, link_field, link, name_hint):
+def _forum_publish(session, base, fid, subject, message, link_field, link, name_hint, quality=None):
     """发主题帖：先 GET 表单刷新会话并解析标签，选好各强制分类的 tagid，再 POST。
     注意：pan1.me 发帖成功不跳转到新主题（返回 200 表单页），成功与否由 _forum_find 查我的主题确认。"""
     form = session.get(base + "/?thread-create-0.htm", timeout=30)
     tags_by_fid = _forum_parse_tags(form.text)
-    tagids = _forum_pick_tags(tags_by_fid, fid, name_hint)
+    tagids = _forum_pick_tags(tags_by_fid, fid, name_hint, quality)
     data = {
         "doctype": "0", "quotepid": "0", "fid": str(fid),
         "subject": subject, "message": message,
         "vod_url": "", "http_url": "",
     }
     if link_field == "message":
+        # 链接直接公开追加到正文
         data["message"] = (message + "\n" + (link or "")).strip()
-    elif link_field in ("http_url", "vod_url") and link:
-        data[link_field] = link
+    # link_field=http_url 时链接已由 _forum_message 用 [ttreply] 包裹写入正文；
+    # link_field=vod_url 时链接已由 _forum_message 用 [ttlogin] 包裹写入正文。
+    # 这两个标记由 pan1.me 的 tt_read 插件解析（其发帖页「阅读权限」弹窗即插入同名标记），
+    # 不再往 http_url/vod_url 表单字段写入，避免主题不渲染该字段导致不可见。
     if tagids:
         data["tagid[]"] = tagids
     r = session.post(base + "/?thread-create.htm", data=data,
@@ -1395,9 +1430,10 @@ def run(params, context):
                     cat = _derive_category(t["path"])
                     forum_fid_sel = _category_to_fid(cat, forum_fid)
                     subject = _forum_subject(t, media)
-                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo, out_url)
+                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo, out_url, forum_link_field)
                     pub = _forum_publish(forum_session, forum_base, forum_fid_sel, subject,
-                                         fmsg, forum_link_field, out_url, t["name"])
+                                         fmsg, forum_link_field, out_url, t["name"],
+                                         media.get("quality") if media else None)
                     found = _forum_find(forum_session, forum_base, forum_uid, subject)
                     if found:
                         tid, turl = found
