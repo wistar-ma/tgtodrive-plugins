@@ -35,7 +35,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.18",
+    "version": "1.0.19",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -43,7 +43,7 @@ PLUGIN_MANIFEST = {
         "可通过开关把每个新分享发布到 pan1.me 资源社区（Xiuno 论坛主题帖，带标题去重）。"
         "内置「一标题一链接一帖子」：已分享标题内容有更新时，复用原分享链接发更新通知并原地更新原社区帖，"
         "不新增链接、不新增帖子；并在数据目录自动生成可查询记录页 records.html，"
-        "设置页与运行结果可直接点开；记录页在内网与 http 环境下也可正常复制链接；未发帖的标题在「帖子链接」列显示为未发帖。"
+        "设置页与运行结果可直接点开；记录页在内网与 http 环境下也可正常复制链接；「帖子链接」列直接显示帖子 URL 并可复制，未发帖的标题显示为未发帖。"
     ),
     "author": "wistar",
     "entry": "plugin.py",
@@ -1488,7 +1488,8 @@ function render(){
          <span class="copy" data-copy="${esc(r.share_full)}">复制</span></div>`
       : `<span class="none">—</span>`;
     const forumCell = r.forum
-      ? `<a href="${esc(r.forum)}" target="_blank" rel="noopener">打开帖子</a>`
+      ? `<div class="link-cell"><a href="${esc(r.forum)}" target="_blank" rel="noopener">${esc(r.forum)}</a>
+         <span class="copy" data-copy="${esc(r.forum)}">复制</span></div>`
       : `<span class="none" title="未发布到资源社区（插件里「发布到 pan1.me 资源社区」开关未开启时不会发帖）">未发帖</span>`;
     const cls = r.status==="已发帖"?"b-ok":(r.status==="仅TG群"?"b-tg":"b-link");
     return `<tr>
