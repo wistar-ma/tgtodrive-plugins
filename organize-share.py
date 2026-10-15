@@ -35,7 +35,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.15",
+    "version": "1.0.16",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -228,7 +228,7 @@ PLUGIN_MANIFEST = {
         "layout": "stack",
         "components": [
             {"type": "alert", "text": "首次使用：把机器人 @OracleTgto123_Bot 拉进目标群并在群里发消息，用「获取群ID」模式拿到 chat_id 填入上方。再在「我的插件→定时执行」里配 cron（如 */3 * * * *）即可自动扫描。", "style": {"tone": "warning"}},
-            {"type": "alert", "text": "查询记录：每次运行后会在本插件数据目录自动生成可查询记录页 records.html。容器内路径 /app/db/toolbox/plugins/organize-share/data/records.html（随 /app/db 绑定挂载，宿主机即 <TgtoDrive>/db/toolbox/plugins/organize-share/data/records.html）。用浏览器打开即可搜索/筛选/导出；也可下载到本地打开。", "style": {"tone": "info"}},
+            {"type": "alert", "text": "查询记录：每次运行后会在本插件数据目录自动生成可查询记录页 records.html。容器内路径 /app/db/toolbox/plugins/organize-share/data/records.html（随 /app/db 绑定挂载，宿主机即 <TgtoDrive>/db/toolbox/plugins/organize-share/data/records.html）。用浏览器打开即可搜索/筛选/导出；也可下载到本地打开。", "style": {"tone": "muted"}},
             {"type": "heading", "text": "运行与发送"},
             {"type": "field", "name": "mode"},
             {"type": "field", "name": "chat_id"},
@@ -255,8 +255,44 @@ PLUGIN_MANIFEST = {
     },
 }
 
+# 平台 UI 组件允许的 style 取值（见 docs/toolbox-plugins.md）。
+# 一旦出现非法值，整个清单会校验失败、插件在列表里直接消失，因此这里做归一化兜底。
+_VALID_TONES = {"default", "primary", "success", "warning", "danger", "muted"}
+_VALID_ALIGNS = {"left", "center", "right"}
+_VALID_SIZES = {"small", "normal", "large"}
+_VALID_VARIANTS = {"solid", "outline", "soft"}
+
+
+def _sanitize_ui(node):
+    """递归修正 ui 组件树（清单或运行结果）里非法的 style 取值，避免清单校验失败。"""
+    if isinstance(node, list):
+        for item in node:
+            _sanitize_ui(item)
+        return node
+    if isinstance(node, dict):
+        st = node.get("style")
+        if isinstance(st, dict):
+            if str(st.get("tone", "")).lower() not in _VALID_TONES:
+                st.pop("tone", None)
+            if str(st.get("align", "")).lower() not in _VALID_ALIGNS:
+                st.pop("align", None)
+            if str(st.get("size", "")).lower() not in _VALID_SIZES:
+                st.pop("size", None)
+            if str(st.get("variant", "")).lower() not in _VALID_VARIANTS:
+                st.pop("variant", None)
+            if not st:
+                node.pop("style", None)
+        for val in list(node.values()):
+            if isinstance(val, (list, dict)):
+                _sanitize_ui(val)
+    return node
+
+
+_sanitize_ui(PLUGIN_MANIFEST.get("ui") or {})
+
 
 # ---------------------- 常量与路径 ----------------------
+
 ENV_PATH = "/app/db/user.env"
 WEB_BASE = "https://www.123pan.cn/b"
 DEFAULT_TEMPLATE = "🎬 《{title}》{year_block}\n📂 分类：{category}\n🔗 分享链接：{url}\n🔑 提取码：{pwd}"
@@ -1305,7 +1341,7 @@ def _get_chat_id(token):
     return {
         "hint": "复制下面的 chat_id 填入「目标 TG 群 chat_id」，并保存为插件设置。",
         "groups": groups,
-        "ui": {
+        "ui": _sanitize_ui({
             "layout": "stack",
             "components": [
                 {
@@ -1315,7 +1351,7 @@ def _get_chat_id(token):
                     "rows": [[str(g["chat_id"]), g.get("title") or "", g.get("type") or ""] for g in groups],
                 }
             ],
-        },
+        }),
     }
 
 
@@ -1671,7 +1707,7 @@ def run(params, context):
         return {
             "新增待处理": len(todo),
             "样本(前50)": samples,
-            "ui": {
+            "ui": _sanitize_ui({
                 "layout": "stack",
                 "components": [
                     {"type": "alert", "text": "试运行：仅列出，未建链未发送。", "style": {"tone": "muted"}},
@@ -1682,7 +1718,7 @@ def run(params, context):
                         "rows": [[s["name"], s["category"], s["path"]] for s in samples],
                     },
                 ],
-            },
+            }),
         }
 
     processed = 0
@@ -1960,7 +1996,7 @@ def run(params, context):
         {
             "type": "alert",
             "text": "查询记录页已更新：%s（用浏览器打开可搜索/筛选/导出 CSV）" % str(records_path),
-            "style": {"tone": "info"},
+            "style": {"tone": "muted"},
         },
         {
             "type": "table",
@@ -1973,7 +2009,7 @@ def run(params, context):
         components.insert(0, {
             "type": "alert",
             "text": "本次检测到 %d 个标题更新，已复用原分享链接、原地更新原帖（未新增链接/帖子）。" % len(upd_results),
-            "style": {"tone": "info"},
+            "style": {"tone": "muted"},
         })
         components.append({
             "type": "table",
@@ -1991,5 +2027,5 @@ def run(params, context):
         "更新通知(群)": upd_notified,
         "更新改帖": upd_posted,
         "记录页": str(records_path),
-        "ui": {"layout": "stack", "components": components},
+        "ui": {"layout": "stack", "components": _sanitize_ui(components)},
     }
