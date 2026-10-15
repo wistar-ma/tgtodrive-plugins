@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.5",
+    "version": "1.0.8",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -515,12 +515,14 @@ VIDEO_EXT_RE = re.compile(
 EP_RE = re.compile(r"S\d{1,2}\.?[Ee](\d{1,4})")
 EP_CN_RE = re.compile(r"第(\d{1,4})集")
 QUALITY_RES = [
-    ("8K", re.compile(r"4320p|8K", re.I)),
-    ("4K", re.compile(r"2160p|4K\b", re.I)),
-    ("1080p", re.compile(r"1080[pi]", re.I)),
-    ("720p", re.compile(r"720p", re.I)),
-    ("480p", re.compile(r"480p", re.I)),
+    ("8K", re.compile(r"4320p|7680x?4320|8K\b", re.I)),
+    ("4K", re.compile(r"2160p|3840x?2160|4K\b", re.I)),
+    ("1080p", re.compile(r"1080[pi]|1920x?1080|\bFHD\b", re.I)),
+    ("720p", re.compile(r"720p|1280x?720", re.I)),
+    ("480p", re.compile(r"480p|640x?480|\bSD\b", re.I)),
 ]
+SAMPLE_RE = re.compile(
+    r"sample|trailer|preview|featurette|behindthescenes|!q\d*|\bSP\d+|\bNCED\b|\bNCOP\b", re.I)
 SOURCE_RE = re.compile(r"WEB-?DL|WEB-?Rip|BluRay|BDMV|Remux|HDTV|DVD|WEB", re.I)
 CODEC_RE = re.compile(r"H\.?26[56]|x26[45]|HEVC|AV1|VC-?1", re.I)
 HDR_RE = re.compile(r"HDR10\+|HDR|HLG|DoVi|Dolby[ .]?Vision|SDR", re.I)
@@ -539,24 +541,36 @@ def _media_info(c, title_info):
     all_size = 0
     video_size = 0
 
+    def _rlist(pid, tries=3):
+        # 123 接口密集调用时可能返回空列表，空结果重试几次以抵御限流抖动
+        items = []
+        for i in range(tries):
+            try:
+                items = _list_dir(c, pid)
+            except Exception:
+                items = []
+            if items:
+                return items
+            time.sleep(1 + i)
+        return items
+
     def walk(pid, depth):
         nonlocal all_size, video_size
-        if depth > 1:
+        if depth > 2:
             return
-        try:
-            items = _list_dir(c, pid)
-        except Exception:
-            return
-        for it in items:
+        for it in _rlist(pid):
             nm = it.get("FileName", "")
-            if it.get("Type") == 2:
+            if SAMPLE_RE.search(nm):
+                continue
+            if it.get("Type") == 1:
+                walk(it.get("FileId"), depth + 1)
+            else:
+                # 文件：123 web 接口的文件 Type 可能是 0 或 2，统一按「非目录(=1)」处理
                 sz = int(it.get("Size") or 0)
                 all_size += sz
                 if VIDEO_EXT_RE.search(nm):
                     names.append(nm)
                     video_size += sz
-            elif it.get("Type") == 1:
-                walk(it.get("FileId"), depth + 1)
 
     walk(title_info["file_id"], 0)
     blob = " ".join(names)
@@ -595,6 +609,14 @@ def _media_info(c, title_info):
     return info
 
 
+COUNTRY_ZH = {
+    "CN": "中国大陆", "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门",
+    "US": "美国", "JP": "日本", "KR": "韩国", "GB": "英国", "FR": "法国",
+    "DE": "德国", "IT": "意大利", "ES": "西班牙", "IN": "印度", "TH": "泰国",
+    "RU": "俄罗斯", "CA": "加拿大", "AU": "澳大利亚", "SG": "新加坡", "VN": "越南",
+}
+
+
 def _tmdb_info(env, title_info, category):
     """按文件夹名里的 {tmdb-xxxx} id 抓 TMDB 中文资料；返回 None 表示不可用。"""
     key = env.get("ENV_TMDB_API_KEY")
@@ -613,7 +635,7 @@ def _tmdb_info(env, title_info, category):
     img = (env.get("ENV_TMDB_IMAGE_BASE_URL") or "https://image.tmdb.org/t/p").rstrip("/")
     order = ["movie", "tv"] if _is_movie_cat(category) else ["tv", "movie"]
     for kind in order:
-        url = "%s/%s/%s?language=zh-CN&api_key=%s" % (base, kind, tid, key)
+        url = "%s/%s/%s?language=zh-CN&append_to_response=credits&api_key=%s" % (base, kind, tid, key)
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
@@ -628,6 +650,22 @@ def _tmdb_info(env, title_info, category):
         if not d or d.get("success") is False:
             continue
         poster = d.get("poster_path") or ""
+        cast = [p.get("name") for p in ((d.get("credits") or {}).get("cast") or [])
+                if p.get("name")]
+        countries = []
+        for c in (d.get("production_countries") or []):
+            code = c.get("iso_3166_1") or ""
+            if code in COUNTRY_ZH:
+                countries.append(COUNTRY_ZH[code])
+            elif c.get("name"):
+                countries.append(c["name"])
+        if not countries:
+            countries = [COUNTRY_ZH.get(code, code) for code in (d.get("origin_country") or []) if code]
+        langs = [l.get("name") for l in (d.get("spoken_languages") or []) if l.get("name")]
+        runtime = d.get("runtime") or 0
+        if not runtime:
+            ert = d.get("episode_run_time") or []
+            runtime = ert[0] if ert else 0
         return {
             "kind": kind,
             "name": d.get("title") or d.get("name") or "",
@@ -636,6 +674,11 @@ def _tmdb_info(env, title_info, category):
             "date": d.get("release_date") or d.get("first_air_date") or "",
             "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
             "poster_url": (img + "/w500" + poster) if poster else "",
+            "cast": cast[:8],
+            "countries": countries,
+            "languages": langs,
+            "runtime": runtime,
+            "episodes": d.get("number_of_episodes") or 0,
         }
     return None
 
@@ -653,91 +696,127 @@ def _bot_send_photo(token, chat_id, photo, caption_html):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _fmt_cast(cast):
+    cast = cast or []
+    if not cast:
+        return ""
+    shown = " / ".join(cast[:6])
+    if len(cast) > 6:
+        shown += " 等"
+    return shown
+
+
 def _rich_parts(title_info, url, pwd, media, tinfo):
-    """构造富文本消息。返回 (纯文本, HTML卡片文案或None)。"""
+    """构造富文本消息。返回 (纯文本, HTML卡片文案或None)。字段对齐媒体库详情卡：
+    名称/主演/类型/分类/地区/语言/上映/集数/片长/TMDB评分/画质/视频/音频/大小/简介/链接。"""
     title, year, _ = _parse_title(title_info["name"])
     cat = _derive_category(title_info["path"])
+    ti = tinfo or {}
     name_line = "%s (%s)" % (title, year) if year else title
-    lines = ["🎬 名称：" + name_line]
+
+    genres = " / ".join(ti.get("genres") or [])
+    cast = _fmt_cast(ti.get("cast"))
+    countries = " / ".join(ti.get("countries") or [])
+    langs = " / ".join(ti.get("languages") or [])
+    date = ti.get("date") or ""
+    release = "%s(%s)" % (date, countries) if (date and countries) else (date or countries)
+    if ti.get("episodes"):
+        eps = "共 %d 集" % int(ti["episodes"])
+    elif media and media.get("episodes"):
+        eps = media["episodes"]
+    else:
+        eps = ""
+    runtime = ti.get("runtime") or 0
+    if runtime:
+        dur = "%d 分钟" % runtime if _is_movie_cat(cat) else "每集 %d 分钟" % runtime
+    else:
+        dur = ""
+    try:
+        vote = "%.1f/10" % float(ti["vote"]) if ti.get("vote") else ""
+    except (TypeError, ValueError):
+        vote = ""
+
+    rows = [("🎬 名称", name_line)]
+    if cast:
+        rows.append(("🎭 主演", cast))
+    if genres:
+        rows.append(("🎞 类型", genres))
     if cat:
-        lines.append("📂 类型：" + cat)
+        rows.append(("📂 分类", cat))
+    if countries:
+        rows.append(("🌍 地区", countries))
+    if langs:
+        rows.append(("🗣 语言", langs))
+    if release:
+        rows.append(("📅 上映", release))
+    if eps:
+        rows.append(("🔢 集数", eps))
+    if dur:
+        rows.append(("⏱ 片长", dur))
+    if vote:
+        rows.append(("⭐ TMDB评分", vote))
     if media:
         if media.get("quality"):
-            lines.append("🖥 画质：" + media["quality"])
+            rows.append(("🖥 画质", media["quality"]))
         if media.get("video"):
-            lines.append("🎥 视频：" + media["video"])
+            rows.append(("🎥 视频", media["video"]))
         if media.get("audio"):
-            lines.append("🎧 音频：" + media["audio"])
+            rows.append(("🎧 音频", media["audio"]))
         if media.get("size_gb"):
-            lines.append("📦 大小：%s GB" % media["size_gb"])
-        if media.get("episodes"):
-            lines.append("🎞 集数：%s" % media["episodes"])
-    if tinfo:
-        try:
-            if tinfo.get("vote"):
-                lines.append("⭐ TMDB评分：%.1f/10" % float(tinfo["vote"]))
-        except (TypeError, ValueError):
-            pass
-        if tinfo.get("date"):
-            lines.append("📅 播出日期：" + tinfo["date"])
-        gs = tinfo.get("genres") or []
-        if gs:
-            lines.append("🏷 标签：" + " ".join("#" + g for g in gs[:4]))
-    overview = (tinfo or {}).get("overview") or ""
-    if overview:
-        short = overview[:120] + ("…" if len(overview) > 120 else "")
-        lines.append("")
-        lines.append("📝 简介：")
-        lines.append(short)
-    lines.append("")
-    lines.append("🔗 链接：" + (url or ""))
-    if pwd:
-        lines.append("🔑 提取码：" + pwd)
-    plain = "\n".join(lines)
+            rows.append(("📦 大小", "%s GB" % media["size_gb"]))
 
+    overview = (ti.get("overview") or "").strip()
+
+    # ---- 纯文本 ----
+    plain_lines = ["%s：%s" % (k, v) for k, v in rows]
+    if overview:
+        plain_lines += ["", "📝 简介：", overview]
+    plain_lines += ["", "🔗 链接：" + (url or "")]
+    if pwd:
+        plain_lines.append("🔑 提取码：" + pwd)
+    plain = "\n".join(plain_lines)
+
+    # ---- HTML 卡片（sendPhoto caption，需 ≤1024 字符；超长则自动压缩简介）----
     html_cap = None
-    if tinfo and tinfo.get("poster_url"):
-        h = ["🎬 <b>%s</b>" % _html.escape(name_line)]
-        if cat:
-            h.append("📂 类型：%s" % _html.escape(cat))
-        if media:
-            if media.get("quality"):
-                h.append("🖥 画质：%s" % _html.escape(media["quality"]))
-            if media.get("video"):
-                h.append("🎥 视频：%s" % _html.escape(media["video"]))
-            if media.get("audio"):
-                h.append("🎧 音频：%s" % _html.escape(media["audio"]))
-            if media.get("size_gb"):
-                h.append("📦 大小：%s GB" % media["size_gb"])
-            if media.get("episodes"):
-                h.append("🎞 集数：%s" % _html.escape(media["episodes"]))
-        if tinfo:
-            try:
-                if tinfo.get("vote"):
-                    h.append("⭐ TMDB评分：%.1f/10" % float(tinfo["vote"]))
-            except (TypeError, ValueError):
-                pass
-            if tinfo.get("date"):
-                h.append("📅 播出日期：%s" % _html.escape(tinfo["date"]))
-            gs = tinfo.get("genres") or []
-            if gs:
-                h.append("🏷 标签：%s" % " ".join("#" + _html.escape(g) for g in gs[:4]))
+    if ti.get("poster_url"):
+        head = "🎬 <b>%s</b>" % _html.escape(name_line)
+        row_html = ["%s：%s" % (k, _html.escape(str(v))) for k, v in rows[1:]]
+        link_html = '🔗 <a href="%s">点击保存到 123 云盘</a>' % _html.escape(url or "")
+        pwd_html = ("🔑 提取码：<code>%s</code>" % _html.escape(pwd)) if pwd else ""
+
+        def _cap(ov):
+            parts = [head] + row_html
+            if ov:
+                parts += ["", "📝 简介：", "<blockquote>%s</blockquote>" % _html.escape(ov)]
+            parts += ["", link_html]
+            if pwd_html:
+                parts.append(pwd_html)
+            return "\n".join(parts)
+
+        cap = ""
         if overview:
-            short = overview[:110] + ("…" if len(overview) > 110 else "")
-            h.append("")
-            h.append("📝 简介：")
-            h.append("<blockquote>%s</blockquote>" % _html.escape(short))
-        h.append("")
-        h.append('🔗 <a href="%s">点击保存到 123 云盘</a>' % _html.escape(url or ""))
-        if pwd:
-            h.append("🔑 提取码：<code>%s</code>" % _html.escape(pwd))
-        html_cap = "\n".join(h)
+            n = len(overview)
+            while n >= 0:
+                ov = overview[:n] + ("…" if n < len(overview) else "")
+                cap = _cap(ov)
+                if len(cap) <= 1024:
+                    break
+                n -= 30
+            if len(cap) > 1024:
+                cap = _cap("")
+        else:
+            cap = _cap("")
+        html_cap = cap
     return plain, html_cap
 
 
 # ---------------------- pan1.me 资源社区发帖 ----------------------
 FORUM_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _esc(s):
+    return _html.escape(str(s or ""), quote=True)
 
 
 def _forum_cfg(env):
@@ -895,40 +974,135 @@ def _category_to_fid(category, fixed):
     return "45"
 
 
-def _forum_subject(title_info):
+def _forum_subject(title_info, media=None):
     title, year, _ = _parse_title(title_info["name"])
     s = "%s (%s)" % (title, year) if year else title
-    return s.strip()[:100]
-
-
-def _forum_message(title_info, pwd, cat, media=None, tinfo=None):
-    title, year, _ = _parse_title(title_info["name"])
-    head = "《%s》%s" % (title, " (%s)" % year if year else "")
-    lines = [head]
-    if cat:
-        lines.append("分类：%s" % cat)
     if media:
         spec = " ".join(x for x in [media.get("quality"), media.get("video"), media.get("audio")] if x)
         if spec:
-            lines.append("规格：%s" % spec)
-        if media.get("size_gb"):
-            lines.append("体积：%s GB" % media["size_gb"])
-        if media.get("episodes"):
-            lines.append("集数：%s" % media["episodes"])
-    if tinfo:
+            s = "%s %s" % (s, spec)
+    return s.strip()[:100]
+
+
+# 123 分享链接在社区统一用 123865 域名（TgtoDrive 社区发帖同款）
+FORUM_LINK_DOMAIN = "https://www.123865.com"
+
+
+def _forum_rewrite_domain(url):
+    if not url:
+        return url
+    return re.sub(r"https?://[^/]+", FORUM_LINK_DOMAIN, url)
+
+
+def _forum_message(title_info, pwd, cat, media=None, tinfo=None, link=None):
+    """论坛正文：参考 TgtoDrive 社区发帖格式——海报卡片 + 简介 + alert 链接区块（链接必须放正文）。"""
+    title, year, _ = _parse_title(title_info["name"])
+    link = _forum_rewrite_domain(link)
+    if link and pwd and "pwd=" not in link:
+        link = "%s?pwd=%s" % (link, pwd)
+    parts = []
+    if tinfo and tinfo.get("poster_url"):
+        # 海报卡片（TgtoDrive 社区同款 movie-card）
+        rows = []
         try:
             if tinfo.get("vote"):
-                lines.append("TMDB评分：%.1f/10" % float(tinfo["vote"]))
+                rows.append(("评分：", "%.1f" % float(tinfo["vote"])))
         except (TypeError, ValueError):
             pass
+        if year:
+            rows.append(("年份：", year))
+        gs = " / ".join(tinfo.get("genres") or [])
+        if gs:
+            rows.append(("类型：", gs))
+        cast = _fmt_cast(tinfo.get("cast"))
+        if cast:
+            rows.append(("主演：", cast))
+        countries = " / ".join(tinfo.get("countries") or [])
+        if countries:
+            rows.append(("地区：", countries))
+        langs = " / ".join(tinfo.get("languages") or [])
+        if langs:
+            rows.append(("语言：", langs))
         if tinfo.get("date"):
-            lines.append("播出日期：%s" % tinfo["date"])
+            rel = "%s(%s)" % (tinfo["date"], countries) if countries else tinfo["date"]
+            rows.append(("上映：", rel))
+        if tinfo.get("episodes"):
+            rows.append(("集数：", "共 %d 集" % int(tinfo["episodes"])))
+        elif media and media.get("episodes"):
+            rows.append(("集数：", media["episodes"]))
+        rt = tinfo.get("runtime") or 0
+        if rt:
+            rows.append(("片长：", "%d 分钟" % rt if _is_movie_cat(cat) else "每集 %d 分钟" % rt))
+        if media:
+            spec = " ".join(x for x in [media.get("quality"), media.get("video"), media.get("audio")] if x)
+            if spec:
+                rows.append(("规格：", spec))
+            if media.get("size_gb"):
+                rows.append(("体积：", "%s GB" % media["size_gb"]))
+        detail = "".join('<div class="detail-label">%s</div><div>%s</div>' % (k, _esc(v)) for k, v in rows)
+        card = ('<div class="movie-card"><div class="movie-poster">'
+                '<img src="%s" alt="%s 海报" /></div><div class="movie-info">'
+                '<h2 class="movie-title">%s</h2><div class="movie-details">%s</div></div></div>'
+                % (tinfo["poster_url"], _esc(title), _esc(title), detail))
+        parts.append(card)
         overview = (tinfo.get("overview") or "").strip()
         if overview:
-            lines.append("简介：%s%s" % (overview[:150], "…" if len(overview) > 150 else ""))
-    if pwd:
-        lines.append("提取码：%s" % pwd)
-    return "\n".join(lines)
+            parts.append('<div class="movie-plot"><h3 class="plot-title">剧情简介：</h3>'
+                         '<p class="plot-content">%s</p></div>' % _esc(overview))
+    else:
+        head = "《%s》%s" % (title, " (%s)" % year if year else "")
+        lines = [head]
+        if cat:
+            lines.append("分类：%s" % cat)
+        if tinfo:
+            gs = " / ".join(tinfo.get("genres") or [])
+            if gs:
+                lines.append("类型：%s" % gs)
+            cast = _fmt_cast(tinfo.get("cast"))
+            if cast:
+                lines.append("主演：%s" % cast)
+            countries = " / ".join(tinfo.get("countries") or [])
+            if countries:
+                lines.append("地区：%s" % countries)
+            langs = " / ".join(tinfo.get("languages") or [])
+            if langs:
+                lines.append("语言：%s" % langs)
+            try:
+                if tinfo.get("vote"):
+                    lines.append("TMDB评分：%.1f/10" % float(tinfo["vote"]))
+            except (TypeError, ValueError):
+                pass
+            if tinfo.get("date"):
+                rel = "%s(%s)" % (tinfo["date"], countries) if countries else tinfo["date"]
+                lines.append("上映：%s" % rel)
+            if tinfo.get("episodes"):
+                lines.append("集数：共 %d 集" % int(tinfo["episodes"]))
+            rt = tinfo.get("runtime") or 0
+            if rt:
+                lines.append("片长：%s" % ("%d 分钟" % rt if _is_movie_cat(cat) else "每集 %d 分钟" % rt))
+        if media:
+            spec = " ".join(x for x in [media.get("quality"), media.get("video"), media.get("audio")] if x)
+            if spec:
+                lines.append("规格：%s" % spec)
+            if media.get("size_gb"):
+                lines.append("体积：%s GB" % media["size_gb"])
+            if media.get("episodes") and not (tinfo and tinfo.get("episodes")):
+                lines.append("集数：%s" % media["episodes"])
+        if tinfo:
+            overview = (tinfo.get("overview") or "").strip()
+            if overview:
+                lines.append("简介：%s%s" % (overview[:200], "…" if len(overview) > 200 else ""))
+        parts.append("<p>%s</p>" % _esc("\n".join(lines)).replace("\n", "<br/>"))
+    if link:
+        # 分享链接区块（TgtoDrive 社区同款 alert-success）
+        parts.append(
+            '<div class="alert alert-success" role="alert">'
+            '<div style="text-align: center; color: red; font-weight: bold; margin-bottom: 10px;">'
+            '请您务必转存保存后再进行下载，以免消耗分享者的免登流量</div>'
+            '<hr style="margin: 10px 0;"> '
+            '<a href="%s" target="_blank"><span style="color:#0070c0;">%s</span></a>'
+            '</div>' % (_esc(link), _esc(link)))
+    return "\n".join(parts)
 
 
 def _forum_publish(session, base, fid, subject, message, link_field, link, name_hint):
@@ -938,7 +1112,7 @@ def _forum_publish(session, base, fid, subject, message, link_field, link, name_
     tags_by_fid = _forum_parse_tags(form.text)
     tagids = _forum_pick_tags(tags_by_fid, fid, name_hint)
     data = {
-        "doctype": "1", "quotepid": "0", "fid": str(fid),
+        "doctype": "0", "quotepid": "0", "fid": str(fid),
         "subject": subject, "message": message,
         "vod_url": "", "http_url": "",
     }
@@ -1220,8 +1394,8 @@ def run(params, context):
                 try:
                     cat = _derive_category(t["path"])
                     forum_fid_sel = _category_to_fid(cat, forum_fid)
-                    subject = _forum_subject(t)
-                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo)
+                    subject = _forum_subject(t, media)
+                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo, out_url)
                     pub = _forum_publish(forum_session, forum_base, forum_fid_sel, subject,
                                          fmsg, forum_link_field, out_url, t["name"])
                     found = _forum_find(forum_session, forum_base, forum_uid, subject)
