@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -180,6 +180,14 @@ PLUGIN_MANIFEST = {
             "help": "发帖前拉取「我的主题」，若已存在同题帖（含 TgtoDrive 自带发帖）则跳过，避免重复刷帖。",
         },
         {
+            "name": "merge_pwd",
+            "label": "提取码并入链接",
+            "type": "switch",
+            "required": False,
+            "default": True,
+            "help": "开启后分享链接变为 https://www.123pan.cn/s/xxx?pwd=8888，点击即可带码打开（123 官方及多数解析工具支持），消息里不再另起一行提取码。关闭则链接与提取码分开显示。",
+        },
+        {
             "name": "rich_message",
             "label": "富文本分享卡片",
             "type": "switch",
@@ -218,6 +226,7 @@ PLUGIN_MANIFEST = {
             {"type": "field", "name": "forum_fid"},
             {"type": "field", "name": "forum_link_field"},
             {"type": "field", "name": "forum_dedup"},
+            {"type": "field", "name": "merge_pwd"},
             {"type": "field", "name": "rich_message"},
             {"type": "field", "name": "template"},
         ],
@@ -474,6 +483,13 @@ def _bot_send(token, chat_id, text):
     )
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def _merge_pwd(url, pwd):
+    """把提取码并入分享链接：https://www.123pan.cn/s/xxx?pwd=8888"""
+    if not url or not pwd:
+        return url
+    return "%s?pwd=%s" % (url, pwd)
 
 
 def _build_message(title_info, url, pwd, template, extra=None):
@@ -1046,6 +1062,7 @@ def run(params, context):
     forum_dedup = bool(params.get("forum_dedup", True))
     template = params.get("template") or DEFAULT_TEMPLATE
     rich_enabled = bool(params.get("rich_message", True))
+    merge_pwd = bool(params.get("merge_pwd", True))
     include = _lines(params.get("media_include"))
     exclude = _lines(params.get("media_exclude"))
     token = env.get("ENV_TG_BOT_TOKEN")
@@ -1154,7 +1171,9 @@ def run(params, context):
             print("建链失败 %s: %s" % (t.get("name"), e))
             traceback.print_exc()
             continue
-        msg = _build_message(t, url, diy_pwd, template)
+        out_url = _merge_pwd(url, diy_pwd) if merge_pwd else url
+        show_pwd = None if merge_pwd else diy_pwd
+        msg = _build_message(t, out_url, show_pwd, template)
         media = None
         tinfo = None
         if rich_enabled:
@@ -1167,7 +1186,7 @@ def run(params, context):
             except Exception as e:
                 print("TMDB 获取失败 %s: %s" % (t.get("name"), e))
             if media or tinfo:
-                plain_msg, html_cap = _rich_parts(t, url, diy_pwd, media, tinfo)
+                plain_msg, html_cap = _rich_parts(t, out_url, show_pwd, media, tinfo)
                 msg = plain_msg
         posted = False
         if post_enabled and chat_id:
@@ -1175,7 +1194,7 @@ def run(params, context):
                 sent_photo = False
                 if rich_enabled and tinfo and tinfo.get("poster_url"):
                     try:
-                        _, cap = _rich_parts(t, url, diy_pwd, media, tinfo)
+                        _, cap = _rich_parts(t, out_url, show_pwd, media, tinfo)
                         _bot_send_photo(token, chat_id, tinfo["poster_url"], cap)
                         sent_photo = True
                     except Exception as pe:
@@ -1202,9 +1221,9 @@ def run(params, context):
                     cat = _derive_category(t["path"])
                     fid = _category_to_fid(cat, forum_fid)
                     subject = _forum_subject(t)
-                    fmsg = _forum_message(t, diy_pwd, cat, media, tinfo)
+                    fmsg = _forum_message(t, show_pwd, cat, media, tinfo)
                     pub = _forum_publish(forum_session, forum_base, fid, subject,
-                                         fmsg, forum_link_field, url, t["name"])
+                                         fmsg, forum_link_field, out_url, t["name"])
                     found = _forum_find(forum_session, forum_base, forum_uid, subject)
                     if found:
                         tid, turl = found
@@ -1227,7 +1246,7 @@ def run(params, context):
             "ts": int(time.time()),
         }
         processed += 1
-        results.append({"name": t["name"], "url": url, "posted": posted,
+        results.append({"name": t["name"], "url": out_url, "posted": posted,
                         "community_posted": community_posted,
                         "community_info": community_info})
 
