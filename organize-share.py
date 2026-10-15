@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
@@ -1219,17 +1219,17 @@ def run(params, context):
             else:
                 try:
                     cat = _derive_category(t["path"])
-                    fid = _category_to_fid(cat, forum_fid)
+                    forum_fid_sel = _category_to_fid(cat, forum_fid)
                     subject = _forum_subject(t)
                     fmsg = _forum_message(t, show_pwd, cat, media, tinfo)
-                    pub = _forum_publish(forum_session, forum_base, fid, subject,
+                    pub = _forum_publish(forum_session, forum_base, forum_fid_sel, subject,
                                          fmsg, forum_link_field, out_url, t["name"])
                     found = _forum_find(forum_session, forum_base, forum_uid, subject)
                     if found:
                         tid, turl = found
                         community_posted = True
                         community_info = "已发社区(%s) #%s" % (
-                            FORUM_FID_NAMES.get(str(fid), "fid=%s" % fid), tid)
+                            FORUM_FID_NAMES.get(str(forum_fid_sel), "fid=%s" % forum_fid_sel), tid)
                         forum_titles.append((tid, subject))
                         print("社区发帖成功 %s -> %s (tags=%s)" % (t["name"], turl, pub.get("tagids")))
                     else:
