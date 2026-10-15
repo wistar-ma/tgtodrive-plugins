@@ -35,14 +35,15 @@ PLUGIN_MANIFEST = {
     "schema_version": 1,
     "id": "organize-share",
     "name": "整理后自动分享",
-    "version": "1.0.16",
+    "version": "1.0.18",
     "description": (
         "TgtoDrive 整理完成后，自动为整理好的剧/电影生成 123 云盘分享链接并发送到 Telegram 群。"
         "扫描 123 整理目标目录树，识别带 {tmdb} 的标题文件夹，仅「新增」标题才建链发群；"
         "首次运行只记录基线（不发群），避免历史刷屏。支持快速/全量扫描、回填补发、试运行、获取群 chat_id。"
         "可通过开关把每个新分享发布到 pan1.me 资源社区（Xiuno 论坛主题帖，带标题去重）。"
         "内置「一标题一链接一帖子」：已分享标题内容有更新时，复用原分享链接发更新通知并原地更新原社区帖，"
-        "不新增链接、不新增帖子；并在数据目录自动生成可查询记录页 records.html。"
+        "不新增链接、不新增帖子；并在数据目录自动生成可查询记录页 records.html，"
+        "设置页与运行结果可直接点开；记录页在内网与 http 环境下也可正常复制链接；未发帖的标题在「帖子链接」列显示为未发帖。"
     ),
     "author": "wistar",
     "entry": "plugin.py",
@@ -90,6 +91,15 @@ PLUGIN_MANIFEST = {
             "max": 30,
             "step": 1,
             "help": "0=永久；123 仅支持 0/1/7/30。",
+        },
+        {
+            "name": "records_url",
+            "label": "记录页访问地址",
+            "type": "text",
+            "required": False,
+            "default": "http://10.88.88.70:18085/records.html",
+            "placeholder": "http://10.88.88.70:18085/records.html",
+            "help": "记录页 records.html 的可点击地址（由宿主机 Caddy 只读托管）。留空则运行结果中只显示文件路径。",
         },
         {
             "name": "target_pid",
@@ -228,12 +238,14 @@ PLUGIN_MANIFEST = {
         "layout": "stack",
         "components": [
             {"type": "alert", "text": "首次使用：把机器人 @OracleTgto123_Bot 拉进目标群并在群里发消息，用「获取群ID」模式拿到 chat_id 填入上方。再在「我的插件→定时执行」里配 cron（如 */3 * * * *）即可自动扫描。", "style": {"tone": "warning"}},
-            {"type": "alert", "text": "查询记录：每次运行后会在本插件数据目录自动生成可查询记录页 records.html。容器内路径 /app/db/toolbox/plugins/organize-share/data/records.html（随 /app/db 绑定挂载，宿主机即 <TgtoDrive>/db/toolbox/plugins/organize-share/data/records.html）。用浏览器打开即可搜索/筛选/导出；也可下载到本地打开。", "style": {"tone": "muted"}},
+            {"type": "alert", "text": "查询记录：每次运行后会在本插件数据目录自动生成可查询记录页 records.html（含搜索/筛选/排序/导出 CSV）。容器内路径 /app/db/toolbox/plugins/organize-share/data/records.html。", "style": {"tone": "muted"}},
+            {"type": "link", "href": "http://10.88.88.70:18085/records.html", "label": "打开查询记录页（内网）"},
             {"type": "heading", "text": "运行与发送"},
             {"type": "field", "name": "mode"},
             {"type": "field", "name": "chat_id"},
             {"type": "field", "name": "share_pwd"},
             {"type": "field", "name": "share_expire"},
+            {"type": "field", "name": "records_url"},
             {"type": "heading", "text": "扫描范围"},
             {"type": "field", "name": "target_pid"},
             {"type": "field", "name": "year_threshold"},
@@ -1477,7 +1489,7 @@ function render(){
       : `<span class="none">—</span>`;
     const forumCell = r.forum
       ? `<a href="${esc(r.forum)}" target="_blank" rel="noopener">打开帖子</a>`
-      : `<span class="none">—</span>`;
+      : `<span class="none" title="未发布到资源社区（插件里「发布到 pan1.me 资源社区」开关未开启时不会发帖）">未发帖</span>`;
     const cls = r.status==="已发帖"?"b-ok":(r.status==="仅TG群"?"b-tg":"b-link");
     return `<tr>
       <td><div class="t-title">${esc(r.title)} <span class="t-year">${esc(r.year)}</span></div></td>
@@ -1500,9 +1512,40 @@ document.querySelectorAll("th[data-k]").forEach(th=>th.onclick=()=>{
 document.getElementById("q").oninput=render;
 document.getElementById("cat").onchange=render;
 document.getElementById("st").onchange=render;
+/* 复制：页面可能是 http 打开（非安全上下文），此时 navigator.clipboard 不存在，
+   必须回退到 textarea + execCommand，否则点了没任何反应。 */
+function doCopy(txt){
+  return new Promise((resolve,reject)=>{
+    if(window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(resolve).catch(()=>legacyCopy(txt,resolve,reject));
+    }else{
+      legacyCopy(txt,resolve,reject);
+    }
+  });
+}
+function legacyCopy(txt,resolve,reject){
+  try{
+    const ta=document.createElement("textarea");
+    ta.value=txt; ta.setAttribute("readonly","");
+    ta.style.position="fixed"; ta.style.top="-1000px"; ta.style.opacity="0";
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try{ta.setSelectionRange(0,ta.value.length);}catch(e){}
+    const ok=document.execCommand("copy");
+    document.body.removeChild(ta);
+    ok?resolve():reject(new Error("execCommand"));
+  }catch(e){reject(e);}
+}
 document.getElementById("tb").addEventListener("click",e=>{
   const t=e.target.closest(".copy"); if(!t) return;
-  navigator.clipboard.writeText(t.dataset.copy).then(()=>{const o=t.textContent;t.textContent="已复制";setTimeout(()=>t.textContent=o,1200);});
+  const txt=t.dataset.copy||"";
+  doCopy(txt).then(()=>{
+    const o=t.textContent; t.textContent="已复制";
+    setTimeout(()=>{t.textContent=o;},1200);
+  }).catch(()=>{
+    t.textContent="复制失败"; setTimeout(()=>{t.textContent="复制";},1500);
+    window.prompt("浏览器拦截了自动复制，请手动复制：",txt);
+  });
 });
 document.getElementById("csv").onclick=()=>{
   const rows=current();
@@ -1623,6 +1666,7 @@ def run(params, context):
     template = params.get("template") or DEFAULT_TEMPLATE
     rich_enabled = bool(params.get("rich_message", True))
     merge_pwd = bool(params.get("merge_pwd", True))
+    records_url = (params.get("records_url") or "").strip()
     include = _lines(params.get("media_include"))
     exclude = _lines(params.get("media_exclude"))
     token = env.get("ENV_TG_BOT_TOKEN")
@@ -1995,16 +2039,19 @@ def run(params, context):
     components = [
         {
             "type": "alert",
-            "text": "查询记录页已更新：%s（用浏览器打开可搜索/筛选/导出 CSV）" % str(records_path),
+            "text": ("查询记录页已更新：%s" % records_url) if records_url else (
+                "查询记录页已更新（文件路径）：%s" % str(records_path)),
             "style": {"tone": "muted"},
         },
-        {
-            "type": "table",
-            "label": "本次新增处理结果",
-            "headers": ["标题", "分享链接", "状态"],
-            "rows": rows,
-        }
     ]
+    if records_url:
+        components.append({"type": "link", "href": records_url, "label": "打开查询记录页"})
+    components.append({
+        "type": "table",
+        "label": "本次新增处理结果",
+        "headers": ["标题", "分享链接", "状态"],
+        "rows": rows,
+    })
     if upd_rows:
         components.insert(0, {
             "type": "alert",
